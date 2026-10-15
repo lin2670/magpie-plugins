@@ -1,0 +1,33 @@
+{
+  "name": "magpie-raccoon-auth",
+  "version": "0.1.0",
+  "description": "magpie provider plugin: 小浣熊 Raccoon (xiaohuanxiong.com) — chat, models, points and the daily point grant, ported from aimod-cc/agent2api",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "raccoon",
+    "xiaohuanxiong",
+    "小浣熊"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "bun test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lin2670/magpie-plugins.git",
+    "directory": "packages/raccoon-auth"
+  },
+  "bugs": {
+    "url": "https://github.com/lin2670/magpie-plugins/issues"
+  },
+  "homepage": "https://github.com/lin2670/magpie-plugins#readme"
+}

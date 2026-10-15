@@ -1,0 +1,33 @@
+{
+  "name": "magpie-catpaw-auth",
+  "version": "0.1.0",
+  "description": "magpie provider plugin: 妙手 CatPaw (Meituan, ai.catpaw.meituan.com) — chat via the round/event/turn conversation protocol, ported from the verified catpaw-proxy.mjs",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "catpaw",
+    "meituan",
+    "妙手"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "bun test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lin2670/magpie-plugins.git",
+    "directory": "packages/catpaw-auth"
+  },
+  "bugs": {
+    "url": "https://github.com/lin2670/magpie-plugins/issues"
+  },
+  "homepage": "https://github.com/lin2670/magpie-plugins#readme"
+}

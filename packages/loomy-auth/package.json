@@ -1,0 +1,33 @@
+{
+  "name": "magpie-loomy-auth",
+  "version": "0.1.0",
+  "description": "magpie provider plugin: Loomy (讯飞, loomyad.xunfei.cn) — chat, models, points and the daily first-login grant, ported from aimod-cc/agent2api",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "loomy",
+    "xunfei",
+    "讯飞"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "bun test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lin2670/magpie-plugins.git",
+    "directory": "packages/loomy-auth"
+  },
+  "bugs": {
+    "url": "https://github.com/lin2670/magpie-plugins/issues"
+  },
+  "homepage": "https://github.com/lin2670/magpie-plugins#readme"
+}
