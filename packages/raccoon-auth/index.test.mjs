@@ -192,13 +192,45 @@ describe("checkin", () => {
   test("triggers the grant and reads it back as claimed", async () => {
     const result = await plugin.auth.checkin(getAuth)
     expect(result.outcome).toBe("claimed")
-    expect(result.credit).toBe(6000)
+    // the daily 6000 from the bills plus the two one-time first-login grants
+    // (3000 each) swept on this first check-in
+    expect(result.credit).toBe(6000 + 6000)
     expect(result.message).toContain("+6000")
+    expect(result.message).toContain("新手奖励")
     expect(fake.state.settingCalls).toBe(1)
+    expect(fake.state.grantCalls).toBe(2)
+    expect(saved.onboardingGrants?.desktop_login_grant).toBeTruthy()
+    expect(saved.onboardingGrants?.mobile_login_grant).toBeTruthy()
+  })
+
+  test("a settled ledger is never asked again", async () => {
+    saved = { ...saved, onboardingGrants: { desktop_login_grant: 1, mobile_login_grant: 1 } }
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(6000)
+    expect(fake.state.grantCalls).toBe(0)
+  })
+
+  test("a refused grant endpoint leaves its key unsettled and the check-in standing", async () => {
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/login/points/grant")) return new Response("boom", { status: 502 })
+      return realFetch(input, init)
+    }
+    try {
+      const result = await plugin.auth.checkin(getAuth)
+      expect(result.outcome).toBe("claimed")
+      expect(result.credit).toBe(6000)
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    expect(saved.onboardingGrants).toBeUndefined()
   })
 
   test("no grant today reads as done", async () => {
     fake.state.grantAfterSetting = false
+    saved = { ...saved, onboardingGrants: { desktop_login_grant: 1, mobile_login_grant: 1 } }
     const result = await plugin.auth.checkin(getAuth)
     expect(result.outcome).toBe("done")
   })

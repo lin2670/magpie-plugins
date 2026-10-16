@@ -20,6 +20,8 @@ export function fakeRaccoon() {
     grantedToday: false,
     webCode: "web-code-1",
     spentCodes: new Set(),
+    grantedFirstLogin: new Set(),
+    grantCalls: 0,
     models: [
       { name: "sn-test-1", display_name: "Test One", description: "TestOne", params: { context_window: 1000, max_tokens: 100 }, tags: [] },
       { name: "sn-test-1", display_name: "Duplicate skipped", tags: [] },
@@ -35,6 +37,8 @@ export function fakeRaccoon() {
       state.grantedToday = false
       state.webCode = "web-code-1"
       state.spentCodes = new Set()
+      state.grantedFirstLogin = new Set()
+      state.grantCalls = 0
     },
   }
   const server = Bun.serve({
@@ -99,6 +103,15 @@ export function fakeRaccoon() {
         state.settingCalls++
         if (state.grantAfterSetting) state.grantedToday = true
         return json(200, { code: 0, data: { point_grant_popups: null, point_grant_toast: null } })
+      }
+
+      // the one-time first-login grants: one per endpoint per account
+      // (desktop and mobile are two separate grants), refused forever after
+      if (url.pathname === "/api/web/desktop/v1/login/points/grant" || url.pathname === "/api/web/mobile/v1/login/points/grant") {
+        state.grantCalls++
+        if (state.grantedFirstLogin.has(url.pathname)) return json(200, { code: 0, data: { granted: false } })
+        state.grantedFirstLogin.add(url.pathname)
+        return json(200, { code: 0, data: { granted: true, popup: { source: "login", points: 3000, expire_at: "2027-01-01" } } })
       }
 
       if (url.pathname === "/api/web/points/v1/bills") {

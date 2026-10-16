@@ -375,6 +375,50 @@ export async function RaccoonAuthPlugin({ client } = {}) {
   }
 
   // the daily point grant: the desktop client's settings page triggers it
+  // ── the one-time first-login grants (the onboarding tasks) ────────────────
+  // The vendor has no read-only "did this account already claim its first
+  // login reward" endpoint, so the only source of truth is this account's
+  // own ledger (agent2api onboarding.rs): two grant endpoints, desktop and
+  // mobile, each paid exactly once per account (a repeat answers
+  // granted:false) — the ledger records a settle the moment one of the two
+  // answers, granted or not (both mean the reward is decided), and a settled
+  // key is never requested again.
+  const ONBOARDING_TASKS = [
+    { key: "desktop_login_grant", title: "首次电脑端登录奖励", path: "/api/web/desktop/v1/login/points/grant", mobile: false },
+    { key: "mobile_login_grant", title: "首次手机端登录奖励", path: "/api/web/mobile/v1/login/points/grant", mobile: true },
+  ]
+  const ONBOARDING_POINTS = 3000
+  const desktopHeaders = { "X-Client-Platform": "desktop-windows", "X-Client-Version": "v1.0.0" }
+  const mobileHeaders = { "X-Client-Platform": "app-android", "X-Client-Version": "v1.0.3" }
+
+  const claimOnboarding = async (a) => {
+    const token = stripBearer(a.access)
+    const ledger = { ...(a.onboardingGrants ?? {}) }
+    let claimed = 0
+    let points = 0
+    for (const task of ONBOARDING_TASKS) {
+      if (ledger[task.key]) continue
+      try {
+        // getJSON unwraps the {code, data} envelope: what comes back is
+        // {granted, popup?} directly
+        const data = await getJSON(`${mainOrigin()}${task.path}`, token, 20_000, {
+          ...(task.mobile ? mobileHeaders : desktopHeaders),
+        })
+        const granted = data?.granted === true
+        const popupPoints = toInt(data?.popup?.points)
+        ledger[task.key] = Date.now()
+        if (granted) {
+          claimed++
+          points += popupPoints ?? ONBOARDING_POINTS
+        }
+      } catch {
+        // the endpoint is unusable right now: leave the key unsettled and
+        // let a later check-in try again (a repeat is safe upstream)
+      }
+    }
+    return { ledger, claimed, points }
+  }
+
   // (idempotent for the day), and the bills say whether today's arrived
   // (agent2api claim_daily_grant)
   const checkin = async (getAuth) => {
@@ -404,9 +448,23 @@ export async function RaccoonAuthPlugin({ client } = {}) {
       .map((item) => ({ points: toInt(item?.points), at: String(item?.created_at ?? "") }))
       .filter((g) => g.points != null && g.points > 0 && g.at.slice(0, 10) === today)
       .reduce((sum, g) => sum + g.points, 0)
-    if (granted > 0) return { outcome: "claimed", credit: granted, message: `今日积分 +${granted}` }
     if (triggerError) return { outcome: "failed", message: `签到触发失败：${triggerError}` }
     if (billsError) return { outcome: "failed", message: `未能核对今日入账：${billsError}` }
+    // the one-time grants ride along with the first check-in: unsettled keys
+    // are pressed once, the ledger is written back, and later check-ins skip
+    // settled keys entirely (both granted:true and granted:false settle —
+    // either answer means the reward is decided)
+    let onboardingMsg = ""
+    if (!ONBOARDING_TASKS.every((t) => a.onboardingGrants?.[t.key])) {
+      const { ledger, claimed, points } = await claimOnboarding(a)
+      if (claimed > 0) await client.auth.set({ path: { id: ID }, body: { ...a, onboardingGrants: ledger } })
+      const settledCount = ONBOARDING_TASKS.filter((t) => ledger[t.key]).length
+      if (settledCount === ONBOARDING_TASKS.length)
+        onboardingMsg = claimed > 0 ? `；新手奖励领取 ${claimed} 项 +${points}` : "；新手奖励已领取过"
+      else if (claimed > 0) onboardingMsg = `；新手奖励领取 ${claimed} 项 +${points}`
+    }
+    if (granted > 0) return { outcome: "claimed", credit: granted + (onboardingMsg.match(/\+(\d+)/)?.[1] ? Number(onboardingMsg.match(/\+(\d+)/)[1]) : 0), message: `今日积分 +${granted}${onboardingMsg}` }
+    if (onboardingMsg) return { outcome: "claimed", message: `今日未见积分入账（可能已领取）${onboardingMsg}`.trim() }
     return { outcome: "done", message: "今日未见积分入账（可能已领取）" }
   }
 

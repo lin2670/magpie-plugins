@@ -6,6 +6,19 @@ import { createHash, createHmac } from "node:crypto"
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
 const OK = "000000"
 
+// the client's TASK_POINTS registry, key by key (the server knows these and
+// refuses anything else)
+const TASK_POINTS = {
+  first_message: 500,
+  pick_skill: 1000,
+  generate_ppt: 1500,
+  set_schedule: 1000,
+  install_skill: 1500,
+  configure_remote: 1000,
+  create_soul: 1500,
+  share_soul: 2000,
+}
+
 export function fakeLoomy() {
   const state = {
     session: "sess-1",
@@ -16,6 +29,10 @@ export function fakeLoomy() {
     firstLoginCalls: 0,
     recordsReads: 0,
     modelsReads: 0,
+    // onboarding: done[key]=true once its complete call lands (idempotent)
+    onboardingDone: {},
+    onboardingQueries: 0,
+    onboardingCompletes: 0,
     reset() {
       state.smsSent = null
       state.logins = 0
@@ -23,6 +40,9 @@ export function fakeLoomy() {
       state.firstLoginCalls = 0
       state.recordsReads = 0
       state.modelsReads = 0
+      state.onboardingDone = {}
+      state.onboardingQueries = 0
+      state.onboardingCompletes = 0
     },
   }
   const AK = "2thryby66wxi53sk"
@@ -119,6 +139,23 @@ export function fakeLoomy() {
       if (url.pathname === "/api/v2/points/records") {
         state.recordsReads++
         return json(200, { code: OK, desc: "ok", data: { balance: 5000, dailyBalance: 5000, dailyLimitPoints: 5000, dailyRemainingPoints: 5000, list: [], total: 0 } })
+      }
+
+      // onboarding: the task status table and the per-key completion report
+      // (the report carries no proof; the real vendor credits real points and
+      // answers alreadyCompleted=true idempotently)
+      if (url.pathname === "/api/v1/onboarding/tasks") {
+        state.onboardingQueries++
+        return json(200, { code: OK, desc: "ok", data: { tasks: { ...state.onboardingDone } } })
+      }
+      if (url.pathname === "/api/v1/onboarding/tasks/complete") {
+        state.onboardingCompletes++
+        const reqBody = await req.json().catch(() => ({}))
+        const key = String(reqBody?.key ?? "")
+        if (!key || !(key in TASK_POINTS)) return json(200, { code: "100001", desc: `未知的 task key：${key}` })
+        const already = !!state.onboardingDone[key]
+        state.onboardingDone[key] = true
+        return json(200, { code: OK, desc: "ok", data: { alreadyCompleted: already } })
       }
 
       return json(404, { code: "100003", desc: "no route" })

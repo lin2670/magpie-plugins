@@ -166,9 +166,51 @@ describe("checkin", () => {
     const result = await plugin.auth.checkin(getAuth)
     expect(result.outcome).toBe("claimed")
     // dailyBalance is the refreshed balance, not a grant amount: no credit
-    expect(result.credit).toBeUndefined()
+    // from the daily grant alone — but the newbie-task sweep that rides along
+    // claims all eight one-time keys on the first check-in
+    expect(result.credit).toBe(_internal.ONBOARDING_TOTAL)
     expect(result.message).toContain("5000")
+    expect(result.message).toContain("新手任务")
     expect(fake.state.firstLoginCalls).toBe(1)
+    // the vendor credited the eight keys once, and the account settled
+    expect(fake.state.onboardingCompletes).toBe(_internal.ONBOARDING_TASKS.length)
+    expect(saved.onboardingSettled).toBe(true)
+  })
+
+  test("a settled account skips the newbie-task scan entirely", async () => {
+    saved = { type: "oauth", access: fake.state.session, expires: 0, onboardingSettled: true }
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBeUndefined()
+    expect(fake.state.onboardingQueries).toBe(0)
+    expect(fake.state.onboardingCompletes).toBe(0)
+    expect(fake.state.firstLoginCalls).toBe(1)
+  })
+
+  test("a partly-done table claims only the missing keys", async () => {
+    fake.state.onboardingDone = { first_message: true, pick_skill: true }
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(fake.state.onboardingCompletes).toBe(_internal.ONBOARDING_TASKS.length - 2)
+    expect(result.credit).toBe(_internal.ONBOARDING_TOTAL - 1500)
+    expect(saved.onboardingSettled).toBe(true)
+  })
+
+  test("a scan failure does not fail the daily grant and leaves the account unsettled", async () => {
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/api/v1/onboarding/tasks")) return new Response(JSON.stringify({ code: "100009", desc: "boom" }), { status: 200 })
+      return realFetch(input, init)
+    }
+    try {
+      const result = await plugin.auth.checkin(getAuth)
+      expect(result.outcome).toBe("claimed")
+      expect(result.message).toContain("扫描失败")
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    expect(saved.onboardingSettled).toBeUndefined()
   })
 
   test("a refused session says the sign-in expired", async () => {

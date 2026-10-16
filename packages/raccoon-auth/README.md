@@ -19,6 +19,7 @@ magpie plugin login raccoon     # 选「网页登录」/「从 agent2api 导入�
 - **模型**：`GET {llmBase}/model_catalog`（失败回落静态清单 5 个；重复名首个生效）。
 - **余额（usage）**：`GET /api/web/points/v1/balance` + `entitlement_info`。
 - **每日签到（checkin）**：`GET /api/web/office/v3/setting_info`（带桌面端身份头，按天幂等触发发放）→ `GET /api/web/points/v1/bills` 核对今日（北京时间）入账，入账即 `claimed`。
+- **新手奖励（一次性，随首次签到自动补领）**：两条首登奖励端点各领一次——`POST /api/web/desktop/v1/login/points/grant`（桌面端身份头）与 `POST /api/web/mobile/v1/login/points/grant`（手机端身份头 `app-android`，两端认同一把 Bearer token）。上游没有「领没领过」的只读口，插件按账号记本地台账（`onboardingGrants`）：一次请求无论 `granted` 真假都算该条落定，之后不再发请求；老账号若奖励早被官方客户端领掉，首次请求回 `granted:false`，同样落定。
 
 ## 与 agent2api 并存的注意
 

@@ -60,6 +60,24 @@ const AUTH_CODES = new Set(["020002", "100002"])
 
 const REQUEST_TIMEOUT = 20_000
 
+// ── onboarding (the one-time newbie tasks) ────────────────────────────────
+// Eight keys worth 10000 points in total; the client's task-registry keys,
+// verbatim — an unknown key is refused by the vendor (agent2api
+// providers/loomy/onboarding.rs). "Completion" is judged locally by the
+// official client; the report carries just {key}, no proof, and the vendor
+// credits real points and answers alreadyCompleted=true idempotently.
+const ONBOARDING_TASKS = [
+  { group: "初识 Loomy", key: "first_message", title: "发送你的第一条消息", points: 500 },
+  { group: "初识 Loomy", key: "pick_skill", title: "试试选择一个技能", points: 1000 },
+  { group: "初识 Loomy", key: "generate_ppt", title: "生成第一份 PPT", points: 1500 },
+  { group: "打造你的专属 Loomy", key: "set_schedule", title: "设置定时任务", points: 1000 },
+  { group: "打造你的专属 Loomy", key: "install_skill", title: "在技能广场安装一个技能", points: 1500 },
+  { group: "打造你的专属 Loomy", key: "configure_remote", title: "配置远程控制", points: 1000 },
+  { group: "遇见你的 AI 搭子", key: "create_soul", title: "创建你的第一个搭子", points: 1500 },
+  { group: "遇见你的 AI 搭子", key: "share_soul", title: "把搭子分享给朋友", points: 2000 },
+]
+const ONBOARDING_TOTAL = ONBOARDING_TASKS.reduce((sum, t) => sum + t.points, 0)
+
 // the client's _makeBase() envelope for the account domain
 const makeBase = () => ({
   appid: appId(),
@@ -466,7 +484,12 @@ export async function LoomyAuthPlugin({ client } = {}) {
       },
       // the daily grant: the first login of the vendor's day refreshes the
       // daily wallet; the same call pressed here keeps it refreshed for an
-      // account that isn't logging in (agent2api checkin.rs)
+      // account that isn't logging in (agent2api checkin.rs). The one-time
+      // newbie tasks ride along: a not-yet-settled account gets its unclaimed
+      // keys reported once (the vendor credits real points, idempotent), the
+      // outcome lands in the account record, and every later check-in skips
+      // the scan entirely — settled means settled (agent2api onboarding.rs:
+      // one-time welfare never joins the daily loop again).
       async checkin(getAuth) {
         const a = await getAuth()
         if (a?.type !== "oauth" || !a.access) throw new SignedOut("Loomy：未登录")
@@ -484,10 +507,47 @@ export async function LoomyAuthPlugin({ client } = {}) {
         // the refreshed *balance after*, not the grant (the reference reads
         // it only as a display hint) — so no credit is claimed
         const daily = toNum(payload?.data?.dailyBalance ?? payload?.data?.data?.dailyBalance)
-        return {
-          outcome: "claimed",
-          message: daily != null ? `每日赠送积分已刷新（当前 ${daily}）` : "每日赠送积分已刷新",
+        const dailyMsg = daily != null ? `每日赠送积分已刷新（当前 ${daily}）` : "每日赠送积分已刷新"
+
+        // the newbie tasks, once per account
+        if (a.onboardingSettled) return { outcome: "claimed", message: dailyMsg }
+        let claimed = 0
+        let claimedPoints = 0
+        let scanError = null
+        try {
+          const table = await tokenRequest("GET", "/api/v1/onboarding/tasks", a.access)
+          if (codeOf(table) !== OK) throw new Error(messageOf(table) || `code=${codeOf(table)}`)
+          const done = table?.data?.tasks ?? {}
+          for (const task of ONBOARDING_TASKS) {
+            if (done[task.key]) continue
+            const answer = await tokenRequest("POST", "/api/v1/onboarding/tasks/complete", a.access, { key: task.key })
+            if (codeOf(answer) === OK) {
+              claimed++
+              claimedPoints += task.points
+            }
+            // a single key failing (unknown key, vendor change) doesn't stop
+            // the rest; the next check-in re-runs the scan
+          }
+        } catch (e) {
+          if (e?.signIn === "expired" || e instanceof SignedOut) throw e
+          scanError = e?.message ?? String(e)
         }
+        // the vendor's alreadyCompleted lands as code OK too, so a fully
+        // claimed table still scans clean next time — but once every key is
+        // done upstream, this pass settles the account forever
+        if (claimed > 0 || !scanError) {
+          try {
+            const table = await tokenRequest("GET", "/api/v1/onboarding/tasks", a.access)
+            if (codeOf(table) === OK) {
+              const done = table?.data?.tasks ?? {}
+              const missing = ONBOARDING_TASKS.filter((t) => !done[t.key])
+              if (missing.length === 0) await client.auth.set({ path: { id: ID }, body: { ...a, onboardingSettled: true } })
+            }
+          } catch {}
+        }
+        if (scanError) return { outcome: "claimed", message: `${dailyMsg}；新手任务扫描失败：${scanError}` }
+        if (claimed > 0) return { outcome: "claimed", credit: claimedPoints, message: `${dailyMsg}；新手任务领取 ${claimed} 项 +${claimedPoints} 积分` }
+        return { outcome: "claimed", message: `${dailyMsg}${a.onboardingSettled ? "" : "；新手任务均已领取"}` }
       },
       methods,
     },
@@ -530,6 +590,8 @@ export async function LoomyAuthPlugin({ client } = {}) {
 export const _internal = {
   ID,
   NAME,
+  ONBOARDING_TASKS,
+  ONBOARDING_TOTAL,
   signHeaders,
   escapedPath,
   contentMD5,

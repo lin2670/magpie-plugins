@@ -21,6 +21,7 @@ magpie plugin login loomy     # 选「从 agent2api 导入」/「短信验证码
 - **模型**：`GET /api/v1/models`（OpenAI 形态；能力位读 `capabilities`；展示名尾部倍率 `(x3.0)` 拆为 rate 字段；无静态兜底——Loomy 官方网关没有内置清单）。
 - **余额（usage）**：`GET /api/v2/points/records?...` → 永久积分 + 每日赠送积分两个窗口。
 - **每日签到（checkin）**：`POST /api/v1/points/first-login`（body `{}`）——服务端按"当天是否第一次"把每日赠送刷回 5000；按天幂等，重复调=成功（`claimed`，附当前每日余额）。
+- **新手任务（一次性，随首次签到自动补领）**：`GET /api/v1/onboarding/tasks` 查完成表 → 对未完成 key 逐个 `POST /api/v1/onboarding/tasks/complete`（body `{key}`）。上游只认客户端 task-registry 的 8 个 key（合计 10000 积分，未知 key 报业务错）；上报无行为证明，实测直接到账真积分，`alreadyCompleted=true` 幂等。结算结果写进账号记录（`onboardingSettled`），之后每次签到零请求跳过；单个 key 失败不阻断其余，下轮签到重扫（agent2api `providers/loomy/onboarding.rs` 同语义）。
 
 ## 账号域签名说明
 
