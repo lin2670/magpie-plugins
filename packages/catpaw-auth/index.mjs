@@ -18,8 +18,10 @@ const ORIGIN = "https://ai.catpaw.meituan.com"
 // usage() — sending the cookie here marks the account signed out).
 const balanceUrl = () => process.env.CATPAW_BALANCE_URL || "https://catx.nocode.cn/api/gateway/credit/balance"
 
-// where the CatPaw desktop client (妙手) keeps its sign-in on this machine
-const DEFAULT_AUTH_PATH = "C:/Users/Administrator/.meituan-catpaw/auth.json"
+// the passport domain the web sign-in runs on (login-config / poll-token /
+// current-user, none of them authenticated; the vendor serves them from
+// catx.nocode.cn while the conversation gateway is ai.catpaw.meituan.com)
+const passportBase = () => process.env.CATPAW_PASSPORT_BASE || "https://catx.nocode.cn"
 
 // how long a read of the desktop client's auth.json is trusted before being
 // read again (the proxy's 5-minute cache)
@@ -455,6 +457,83 @@ export async function CatPawAuthPlugin({ client } = {}) {
       },
       // CatPaw has no check-in (confirmed: no such activity in its client)
       methods: [
+        {
+          type: "oauth",
+          label: "网页登录（妙手官方授权页，Web sign-in）",
+          authorize: async () => {
+            // the vendor's own two-channel web login, the poll channel only:
+            // login-config names the entry URL, the browser login claims the
+            // sid, and GET poll-token?sid hands the token straight to us —
+            // server-to-server, no loopback listener, immune to the browser's
+            // private-network check that breaks the vendor's own POST channel
+            // (agent2api login/catpaw.rs, the official client's Promise.race)
+            const state = crypto.randomUUID().replace(/-/g, "")
+            const sid = crypto.randomUUID().replace(/-/g, "")
+            let entry
+            try {
+              const res = await fetch(`${passportBase()}/api/gateway/passport/login-config`, {
+                headers: { Accept: "application/json" },
+                signal: AbortSignal.timeout(10_000),
+              })
+              const payload = await res.json().catch(() => null)
+              entry = payload?.data?.loginEntryUrl
+            } catch (e) {
+              return { type: "failed", error: `无法连接妙手登录服务: ${e?.message ?? e}` }
+            }
+            if (!entry) return { type: "failed", error: "妙手登录服务未返回登录入口地址" }
+            const url = new URL(entry)
+            url.searchParams.set("state", state)
+            url.searchParams.set("sid", sid)
+            url.searchParams.set("redirect", `http://127.0.0.1:9/catpaw-callback`)
+            return {
+              url: url.href,
+              instructions:
+                "浏览器打开上面的妙手登录页并完成登录。登录成功后本插件会自动拿到登录态（约几秒），无需手动输入任何东西；若长时间停在完成页，请回到 magpie 重试一次。",
+              method: "auto",
+              callback: async () => {
+                // poll-token every second until the browser login claims the
+                // sid (data: null = not yet), 3 minutes overall like agent2api
+                const deadline = Date.now() + 180_000
+                let token
+                while (Date.now() < deadline) {
+                  await new Promise((r) => setTimeout(r, 1000))
+                  try {
+                    const res = await fetch(`${passportBase()}/api/gateway/passport/poll-token?sid=${sid}`, {
+                      headers: { Accept: "application/json" },
+                      signal: AbortSignal.timeout(5_000),
+                    })
+                    const payload = await res.json().catch(() => null)
+                    const t = typeof payload?.data === "string" ? payload.data.trim() : ""
+                    if (t) {
+                      token = t
+                      break
+                    }
+                  } catch {
+                    // a single failed poll is skipped, like the vendor's client
+                  }
+                }
+                if (!token) return { type: "failed", error: "网页登录超时（3 分钟内未取到登录态），请重试" }
+                // current-user fills uid/name; failing it does not fail the
+                // sign-in (the token itself is already in hand)
+                let accountId = "妙手网页登录"
+                let uid = ""
+                try {
+                  const res = await fetch(`${passportBase()}/api/gateway/passport/current-user`, {
+                    headers: { Accept: "application/json", "X-Auth-Token": token },
+                    signal: AbortSignal.timeout(10_000),
+                  })
+                  const payload = await res.json().catch(() => null)
+                  const data = payload?.data
+                  if (data) {
+                    uid = String(data.userId ?? "") === "null" ? "" : String(data.userId ?? "")
+                    if (data.userName) accountId = data.userName
+                  }
+                } catch {}
+                return { type: "success", refresh: "", access: token, expires: 0, accountId, ...(uid ? { uid } : {}), source: "web" }
+              },
+            }
+          },
+        },
         {
           type: "oauth",
           label: "妙手桌面端登录态（CatPaw desktop sign-in）",

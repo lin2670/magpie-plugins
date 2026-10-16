@@ -6,6 +6,8 @@
 // credits). Every request shape is ported from aimod-cc/agent2api (MIT),
 // providers/raccoon, rewritten for magpie's plugin API.
 
+import { randomUUID } from "node:crypto"
+
 // agent2apiAccounts reads the accounts agent2api (aimod-cc) keeps on this
 // machine, to import a sign-in from it: nothing is written there. Returns
 // null off the Bun host (no import to offer), [] when agent2api has no data,
@@ -134,6 +136,75 @@ async function renewToken(refreshToken) {
     refresh: String(data?.refresh_token ?? "").trim() || refreshToken,
     expires: jwtEnd(access) || Date.now() + 3600e3,
   }
+}
+
+// ── the web sign-in (the official /code/authorize page) ───────────────────
+// The vendor's desktop login: open the authorize page, the user signs in,
+// the official page redirects to `office-raccoon://auth/callback?code=…&state=…`
+// (with the client installed that deep-link is handed to the OS; without it
+// the address still shows the full callback URL). The plugin never sees the
+// callback itself — the user pastes the whole office-raccoon:// URL back —
+// so the state round-trip is the only proof this code came from a sign-in
+// this plugin started; it is compared verbatim before any exchange
+// (agent2api oauth.rs / parse_callback_code).
+
+const AUTHORIZE_PATH = "/code/authorize"
+const LOGIN_SOURCE = "desktop"
+const APP_NAME = "办公小浣熊客户端"
+const CODE_EXPIRED = 200035 // the authorization code has been spent
+
+const newLoginState = () => crypto.randomUUID().replace(/-/g, "")
+
+// parse the pasted callback URL (or a bare code) into its authorization code,
+// checking scheme/host/path and the state verbatim
+function parseCallback(raw, expectedState) {
+  const text = String(raw ?? "").trim()
+  if (!text) return { error: "请粘贴登录后跳转的 office-raccoon:// 回调地址" }
+  // a bare code is accepted when the user copied just the code parameter
+  if (!text.includes("://")) return { code: text }
+  let url
+  try {
+    url = new URL(text)
+  } catch {
+    return { error: "回调地址无法解析，请完整复制地址栏里的 office-raccoon:// 链接" }
+  }
+  const ok =
+    url.protocol === "office-raccoon:" &&
+    url.hostname.toLowerCase() === "auth" &&
+    url.pathname.replace(/\/+$/, "") === "/callback"
+  if (!ok) return { error: "这不是小浣熊的登录回调地址（应为 office-raccoon://auth/callback?…）" }
+  const code = (url.searchParams.get("code") ?? "").trim()
+  const state = (url.searchParams.get("state") ?? "").trim()
+  if (!code) return { error: "回调地址里没有授权码，请重新发起网页登录" }
+  if (!state) return { error: "回调地址里没有 state，无法确认这次登录由本机发起，请重新发起网页登录" }
+  if (state !== expectedState) return { error: "回调 state 校验失败，请重新发起网页登录" }
+  return { code }
+}
+
+// trade the one-time code for a token pair
+// (POST {authBase}/login_with_authorization_code; agent2api exchange_code —
+// a spent/expired code answers code 200035 and must restart the sign-in)
+async function exchangeWebCode(code) {
+  const res = await fetch(`${authBase()}/login_with_authorization_code`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ authorization_code: code }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const payload = await res.json().catch(() => null)
+  const data = payload && typeof payload.data === "object" && payload.data !== null ? payload.data : {}
+  const access = stripBearer(data.access_token)
+  const refresh = stripBearer(data.refresh_token)
+  if (payload?.code === CODE_EXPIRED)
+    throw new Error("授权码已失效（可能已被使用或放置太久），请重新发起网页登录")
+  if (!res.ok || !access || !refresh)
+    throw new Error(`网页登录换取凭证失败（HTTP ${res.status}）: ${payload?.message || payload?.msg || "无错误说明"}`)
+  const extra = {}
+  for (const key of ["office_identity", "office_org_name", "office_org_role"]) {
+    const v = String(data[key] ?? "").trim()
+    if (v) extra[key] = v
+  }
+  return { access, refresh, expires: jwtEnd(access) || Date.now() + 3600e3, ...extra }
 }
 
 
@@ -383,6 +454,31 @@ export async function RaccoonAuthPlugin({ client } = {}) {
   }
   methods.push({
     type: "oauth",
+    label: "网页登录（小浣熊官方授权页，Web sign-in）",
+    authorize: async () => {
+      const state = newLoginState()
+      const authorizeUrl = `${mainOrigin()}${AUTHORIZE_PATH}?login_source=${LOGIN_SOURCE}&appname=${encodeURIComponent(APP_NAME)}&state=${state}`
+      return {
+        url: authorizeUrl,
+        instructions:
+          "浏览器打开上面的授权页并登录小浣熊。登录成功后页面会跳转 office-raccoon://auth/callback?code=…&state=…——" +
+          "装了小浣熊客户端时会提示打开客户端（取消即可），回调地址始终留在浏览器地址栏。把整条 office-raccoon:// 地址复制粘贴到下一步的输入框里。",
+        method: "code",
+        callback: async (pasted) => {
+          const { code, error } = parseCallback(pasted, state)
+          if (error) return { type: "failed", error }
+          try {
+            const { access, refresh, expires, ...office } = await exchangeWebCode(code)
+            return { type: "success", access, refresh, expires, source: "web", ...office }
+          } catch (e) {
+            return { type: "failed", error: String(e?.message ?? e) }
+          }
+        },
+      }
+    },
+  })
+  methods.push({
+    type: "oauth",
     label: "手动粘贴 token（Paste tokens）",
     prompts: [
       { type: "text", key: "access", message: "accessToken（eyJ… 的 JWT）", validate: (v) => (v && v.trim() ? undefined : "必填") },
@@ -544,6 +640,8 @@ export const _internal = {
   catalogModel,
   renewToken,
   agent2apiAccounts,
+  parseCallback,
+  exchangeWebCode,
   jwtEnd,
   stripBearer,
   toInt,

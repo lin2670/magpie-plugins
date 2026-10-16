@@ -32,7 +32,7 @@ beforeAll(async () => {
   const realFetch = globalThis.fetch
   globalThis.fetch = (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
-    const patched = url.replace("https://ai.catpaw.meituan.com", fake.url)
+    const patched = url.replace("https://ai.catpaw.meituan.com", fake.url).replace("https://catx.nocode.cn", fake.url)
     return realFetch(patched, init)
   }
   plugin = await CatPawAuthPlugin({ client })
@@ -80,6 +80,30 @@ describe("sign-in methods", () => {
     expect(result.type).toBe("success")
     expect(result.access).toBe("pasted-token")
     expect(await method.authorize({ token: "" })).toMatchObject({ type: "failed" })
+  })
+
+  test("web sign-in: login-config names the entry, poll-token hands the token once claimed", async () => {
+    const method = plugin.auth.methods.find((m) => m.label.includes("Web sign-in"))
+    expect(method).toBeTruthy()
+    const flow = await method.authorize()
+    expect(flow.method).toBe("auto")
+    expect(flow.url).toContain("state=")
+    expect(flow.url).toContain("sid=")
+    expect(flow.url).toContain("redirect=")
+    // the sid is not claimed yet: arm it one poll in (the callback polls
+    // every second, so the token appears on its second pass)
+    const sid = new URL(flow.url).searchParams.get("sid")
+    const cb = flow.callback()
+    await new Promise((r) => setTimeout(r, 1200))
+    fake.state.webSids.set(sid, "web-cat-token")
+    const result = await cb
+    expect(result.type).toBe("success")
+    expect(result.access).toBe("web-cat-token")
+    expect(result.source).toBe("web")
+    expect(result.accountId).toBe("网页用户")
+    expect(result.uid).toBe("42")
+    expect(fake.state.pollCalls).toBeGreaterThanOrEqual(2)
+    expect(fake.state.currentUserCalls).toBe(1)
   })
 })
 

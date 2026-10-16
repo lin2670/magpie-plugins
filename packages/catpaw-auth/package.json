@@ -1,6 +1,6 @@
 {
   "name": "magpie-catpaw-auth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "magpie provider plugin: 妙手 CatPaw (Meituan, ai.catpaw.meituan.com) — chat via the round/event/turn conversation protocol, ported from the verified catpaw-proxy.mjs",
   "type": "module",
   "main": "./index.mjs",

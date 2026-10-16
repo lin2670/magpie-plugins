@@ -80,6 +80,38 @@ describe("sign-in methods", () => {
     expect(result.expires).toBe(9999999999 * 1000)
     expect(await method.authorize({ access: "  " })).toMatchObject({ type: "failed" })
   })
+
+  test("web sign-in: the authorize URL carries state, a pasted callback exchanges for a token pair", async () => {
+    const method = plugin.auth.methods.find((m) => m.label.includes("Web sign-in"))
+    const flow = await method.authorize()
+    expect(flow.method).toBe("code")
+    expect(flow.url).toContain("/code/authorize")
+    expect(flow.url).toContain("login_source=desktop")
+    expect(flow.url).toContain("state=")
+    const state = new URL(flow.url).searchParams.get("state")
+    // a wrong state is refused before anything is sent
+    expect(await flow.callback(`office-raccoon://auth/callback?code=web-code-1&state=tampered`)).toMatchObject({ type: "failed" })
+    const result = await flow.callback(`office-raccoon://auth/callback?code=web-code-1&state=${state}`)
+    expect(result.type).toBe("success")
+    expect(result.access).toBe("web-access-1")
+    expect(result.refresh).toBe("web-refresh-1")
+    expect(result.source).toBe("web")
+    expect(result.office_org_name).toBe("测试组织")
+    // the code is one-time: replaying it fails the exchange (200035)
+    const replay = await method.authorize()
+    const r2 = await replay.callback(`office-raccoon://auth/callback?code=web-code-1&state=${new URL(replay.url).searchParams.get("state")}`)
+    expect(r2.type).toBe("failed")
+    expect(r2.error).toContain("重新发起")
+  })
+
+  test("web sign-in: a bare code is accepted, a foreign URL is not", async () => {
+    const method = plugin.auth.methods.find((m) => m.label.includes("Web sign-in"))
+    const flow = await method.authorize()
+    expect(await flow.callback("https://evil.example/callback?code=web-code-1")).toMatchObject({ type: "failed" })
+    const result = await flow.callback("web-code-1")
+    expect(result.type).toBe("success")
+    expect(result.access).toBe("web-access-1")
+  })
 })
 
 describe("chat", () => {

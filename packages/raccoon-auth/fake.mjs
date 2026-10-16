@@ -18,6 +18,8 @@ export function fakeRaccoon() {
     settingCalls: 0,
     grantAfterSetting: true,
     grantedToday: false,
+    webCode: "web-code-1",
+    spentCodes: new Set(),
     models: [
       { name: "sn-test-1", display_name: "Test One", description: "TestOne", params: { context_window: 1000, max_tokens: 100 }, tags: [] },
       { name: "sn-test-1", display_name: "Duplicate skipped", tags: [] },
@@ -31,6 +33,8 @@ export function fakeRaccoon() {
       state.settingCalls = 0
       state.grantAfterSetting = true
       state.grantedToday = false
+      state.webCode = "web-code-1"
+      state.spentCodes = new Set()
     },
   }
   const server = Bun.serve({
@@ -46,6 +50,29 @@ export function fakeRaccoon() {
         state.access = `access-${state.refreshCalls + 1}`
         state.refresh = `refresh-${state.refreshCalls + 1}`
         return json(200, { code: 0, data: { access_token: state.access, refresh_token: state.refresh } })
+      }
+
+      // the web sign-in's code exchange (login_with_authorization_code): a
+      // one-time code → a token pair; a spent code answers the real vendor's
+      // 200035 instead of failing the request
+      if (url.pathname === "/api/web/auth/v1/login_with_authorization_code") {
+        const body = await req.json().catch(() => ({}))
+        const code = String(body?.authorization_code ?? "").trim()
+        if (!code || code !== state.webCode || state.spentCodes.has(code))
+          return json(200, { code: 200035, message: "authorization code expired" })
+        state.spentCodes.add(code)
+        state.access = "web-access-1"
+        state.refresh = "web-refresh-1"
+        return json(200, {
+          code: 0,
+          data: {
+            access_token: state.access,
+            refresh_token: state.refresh,
+            office_identity: "office-id-1",
+            office_org_name: "测试组织",
+            office_org_role: "member",
+          },
+        })
       }
 
       if (auth !== state.access) return json(401, { code: 401, message: "token refused" })

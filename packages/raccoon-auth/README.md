@@ -8,12 +8,12 @@
 
 ```
 magpie plugin add ./packages/raccoon-auth
-magpie plugin login raccoon     # 选「从 agent2api 导入」或「手动粘贴 token」
+magpie plugin login raccoon     # 选「网页登录」/「从 agent2api 导入」/「手动粘贴 token」
 ```
 
 ## 能力
 
-- **登录**：`从 agent2api 导入`（读本机 `~/.agent2api/agent2api.db`，只读不写回；多账号时列表选择）或 `手动粘贴 token`。
+- **登录**：`网页登录`（无需 agent2api：打开小浣熊官方授权页登录，把浏览器跳转的 `office-raccoon://auth/callback?code=…&state=…` 整条粘回来，state 逐字校验后经 `login_with_authorization_code` 换 token 对；授权码一次性，200035=已失效需重发起）、`从 agent2api 导入`（读本机 `~/.agent2api/agent2api.db`，只读不写回；多账号时列表选择）或 `手动粘贴 token`。
 - **续期**：accessToken 临期 5 分钟自动刷新（`POST /api/web/auth/v1/refresh`；响应 `refresh_token` 为空时沿用旧值）。请求中途 401 也会强制续期一次并重试。
 - **聊天**：`POST {llmBase}/chat/completions`，OpenAI 兼容 body 原样透传，SSE 流式；上游回帧中的 `model` 名回写为请求名。
 - **模型**：`GET {llmBase}/model_catalog`（失败回落静态清单 5 个；重复名首个生效）。
