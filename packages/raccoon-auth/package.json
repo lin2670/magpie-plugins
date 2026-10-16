@@ -1,6 +1,6 @@
 {
   "name": "magpie-raccoon-auth",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "magpie provider plugin: 小浣熊 Raccoon (xiaohuanxiong.com) — chat, models, points and the daily point grant, ported from aimod-cc/agent2api",
   "type": "module",
   "main": "./index.mjs",
@@ -10,8 +10,6 @@
     "README.md"
   ],
   "keywords": [
-    "opencode",
-    "opencode-plugin",
     "magpie",
     "raccoon",
     "xiaohuanxiong",

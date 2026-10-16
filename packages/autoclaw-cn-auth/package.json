@@ -1,6 +1,6 @@
 {
   "name": "magpie-autoclaw-cn-auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "magpie provider plugin: AutoClaw 国内版 (智谱 autoglm, autoglm-acceleration-api.zhipuai.cn) — chat, models, point wallets and the daily sign-in, ported from aimod-cc/agent2api",
   "type": "module",
   "main": "./index.mjs",
@@ -10,8 +10,6 @@
     "README.md"
   ],
   "keywords": [
-    "opencode",
-    "opencode-plugin",
     "magpie",
     "autoclaw",
     "autoglm",
