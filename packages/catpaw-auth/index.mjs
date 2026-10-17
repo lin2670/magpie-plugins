@@ -43,10 +43,11 @@ const MODELS = {
 const DEFAULT_MODEL_TYPE = 77
 const modelTypeOf = (id) => MODELS[id]?.type ?? DEFAULT_MODEL_TYPE
 
+// no modalities (the conversation prompt is text-only — see the 400s in the
+// fetch below) and no `limit` (the client publishes no per-model context or
+// output window; an invented number would lie to the agent sizing its prompts)
 const configModel = (id, m) => ({
   name: m.name,
-  ...(m.image ? { modalities: { input: ["text", "image"], output: ["text"] } } : {}),
-  limit: { context: 1_000_000, output: 100_000 },
 })
 
 // ── small helpers ──────────────────────────────────────────────────────────
@@ -105,8 +106,13 @@ function authAccount() {
 
 // ── the gateway ────────────────────────────────────────────────────────────
 
-// gatewayHeaders is what every CatPaw request carries (the proxy's
-// upstreamHeaders, verified 2026-10-09)
+// gatewayHeaders is what every CatPaw request carries. Every value is what
+// the official desktop client itself puts on the wire — captured 2026-10-09
+// from the client talking to its own gateway (002…round.json / 004…turn.json
+// in the capture set): the axios UA, m-debug: true, the m-appkey, the trace
+// ids. The capture's m-host carried the client machine's LAN IP; that is not
+// a value we can truthfully send from somewhere else, so the header is left
+// off entirely rather than invented.
 function gatewayHeaders(token, extra = {}) {
   const traceId = crypto.randomUUID().replace(/-/g, "")
   return {
@@ -115,7 +121,6 @@ function gatewayHeaders(token, extra = {}) {
     "User-Agent": "axios/1.19.0",
     "m-appkey": "com.sankuai.mcopilot.cli",
     "m-debug": "true",
-    "m-host": "catpaw-proxy",
     "m-traceid": traceId,
     "x-request-id": crypto.randomUUID(),
     "x-trace-id": traceId,
@@ -180,6 +185,8 @@ async function* runConversation(token, chat, signal) {
       modelType,
       source: "CatX",
       mode: "CATX_APP",
+      // the client's own round/turn bodies carry this exact value (captured
+      // 2026-10-09, both requests) — the client's default, not ours
       permissionMode: "unsafeBypassPermissions",
       toolVersion: "2.0.2",
       repositories: [],
@@ -211,6 +218,8 @@ async function* runConversation(token, chat, signal) {
     modelType,
     source: "CatX",
     mode: "CATX_APP",
+    // the client's own round/turn bodies carry this exact value (captured
+    // 2026-10-09, both requests) — the client's default, not ours
     permissionMode: "unsafeBypassPermissions",
     toolConfigs: [],
     toolVersion: "2.0.2",
@@ -314,6 +323,17 @@ export async function CatPawAuthPlugin({ client } = {}) {
               return errorResponse(400, "messages is required")
             if (!(chat.model in MODELS) && String(chat.model).trim() !== "")
               return errorResponse(400, `unknown model "${chat.model}" (known: ${Object.keys(MODELS).join(", ")})`)
+            // the flattened one-text prompt the conversation protocol carries
+            // has no room for tool schemas, tool results or image parts: a
+            // request carrying any of them would get an answer that never
+            // calls a tool and never sees the image, with nothing saying why
+            // — refuse it instead (tool continuation is a later phase)
+            if (Array.isArray(chat.tools) && chat.tools.length > 0)
+              return errorResponse(400, "this provider cannot run tools: the conversation protocol takes one flattened text prompt, so tool definitions would be silently dropped (refused rather than answered wrongly)")
+            if (chat.messages.some((m) => m.role === "tool" || (Array.isArray(m.content) && m.content.some((c) => c?.type === "tool_call" || c?.type === "tool_use" || c?.type === "tool_result"))))
+              return errorResponse(400, "this provider cannot continue a tool call: the conversation protocol takes one flattened text prompt, so tool results would be silently dropped (refused rather than answered wrongly)")
+            if (chat.messages.some((m) => Array.isArray(m.content) && m.content.some((c) => c?.type === "image" || (typeof c?.text === "string" && c.text.startsWith("data:image/")))))
+              return errorResponse(400, "this provider cannot take images through the text-only conversation prompt (refused rather than silently dropped)")
 
             // the token: the desktop client's file, or the pasted one
             let token

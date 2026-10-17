@@ -470,8 +470,18 @@ export async function LoomyAuthPlugin({ client } = {}) {
           const data = payload?.data?.data ?? payload?.data ?? {}
           const daily = toNum(data.dailyBalance) ?? 0
           const permanent = toNum(data.balance) ?? 0
+          // the daily wallet from the vendor's own numbers: spent is
+          // dailyLimitPoints - dailyRemainingPoints. When the pair is absent
+          // the wallet is an amount with no limit — a made-up limit would
+          // always read as full
+          const dailyLimit = toNum(data.dailyLimitPoints)
+          const dailyRemaining = toNum(data.dailyRemainingPoints)
+          const dailyWallet =
+            dailyLimit != null && dailyRemaining != null
+              ? { name: "每日赠送积分", used: Math.max(0, dailyLimit - dailyRemaining), amount: dailyRemaining, limit: dailyLimit, unit: "credits", resetsAt: beijingMidnight(), span: 86400 }
+              : { name: "每日赠送积分", used: 0, display: `${daily} credits`, aside: true }
           const windows = [
-            { name: "每日赠送积分", used: 0, amount: daily, limit: daily, unit: "credits", resetsAt: beijingMidnight(), span: 86400 },
+            dailyWallet,
             { name: "永久积分", used: 0, display: `${permanent} credits`, aside: true },
           ]
           // no `signIn` on a clean read: that absence is how magpie takes an

@@ -241,10 +241,31 @@ describe("usage", () => {
     // a clean read says nothing about the sign-in, so magpie can clear a lapse
     expect(usage.signIn).toBeUndefined()
     const daily = usage.windows.find((w) => w.name === "每日赠送积分")
+    // the vendor's own numbers: spent = dailyLimitPoints - dailyRemainingPoints
+    expect(daily.limit).toBe(5000)
+    expect(daily.used).toBe(0)
     expect(daily.amount).toBe(5000)
     expect(daily.resetsAt).toBeGreaterThan(Date.now())
     const permanent = usage.windows.find((w) => w.name === "永久积分")
     expect(permanent.display).toBe("5000 credits")
+  })
+
+  test("a daily wallet without the limit pair is an amount without a limit", async () => {
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input)
+      if (String(url).includes("/api/v2/points/records"))
+        return new Response(JSON.stringify({ code: "000000", desc: "ok", data: { balance: 5000, dailyBalance: 3000, list: [], total: 0 } }), { status: 200 })
+      return realFetch(input, init)
+    }
+    try {
+      const usage = await plugin.auth.usage(getAuth)
+      const daily = usage.windows.find((w) => w.name === "每日赠送积分")
+      expect(daily.limit).toBeUndefined()
+      expect(daily.display).toBe("3000 credits")
+    } finally {
+      globalThis.fetch = realFetch
+    }
   })
 })
 

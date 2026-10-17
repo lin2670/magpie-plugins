@@ -57,7 +57,9 @@ describe("config", () => {
     expect(ids).toContain("longcat-2.0")
     expect(ids).toContain("kimi-k3")
     expect(ids).toContain("glm-5.3-flash")
-    expect(cfg.provider.catpaw.models["longcat-2.0"].modalities).toEqual({ input: ["text", "image"], output: ["text"] })
+    expect(cfg.provider.catpaw.models["longcat-2.0"].modalities).toBeUndefined()
+    // no invented limit: the client publishes no per-model windows
+    expect(cfg.provider.catpaw.models["longcat-2.0"].limit).toBeUndefined()
   })
 })
 
@@ -190,6 +192,33 @@ describe("chat", () => {
     const text = await res.text()
     expect(text).toContain('"error"')
     expect(text).toContain("vendor broke")
+  })
+
+  test("a request carrying tools is refused with a clear 400", async () => {
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "longcat-2.0", messages: [{ role: "user", content: "hi" }], tools: [{ type: "function", function: { name: "f" } }] }),
+    })
+    expect(res.status).toBe(400)
+    const body = await res.json()
+    expect(body.error.message).toContain("cannot run tools")
+  })
+
+  test("a request carrying tool results is refused, images are refused", async () => {
+    const loader = await plugin.auth.loader(getAuth)
+    const toolRes = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "longcat-2.0", messages: [{ role: "user", content: "hi" }, { role: "tool", content: "result" }] }),
+    })
+    expect(toolRes.status).toBe(400)
+    expect((await toolRes.json()).error.message).toContain("cannot continue a tool call")
+    const imgRes = await loader.fetch(`${fake.url}/api/agent/chat/completions`, {
+      method: "POST",
+      body: JSON.stringify({ model: "longcat-2.0", messages: [{ role: "user", content: [{ type: "image", image_url: { url: "data:image/png;base64,AAAA" } }] }] }),
+    })
+    expect(imgRes.status).toBe(400)
+    expect((await imgRes.json()).error.message).toContain("cannot take images")
   })
 
   test("unknown model is rejected", async () => {
