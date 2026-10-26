@@ -139,14 +139,23 @@ async function renewToken(refreshToken) {
 }
 
 // ── the web sign-in (the official /code/authorize page) ───────────────────
-// The vendor's desktop login: open the authorize page, the user signs in,
-// the official page redirects to `office-raccoon://auth/callback?code=…&state=…`
-// (with the client installed that deep-link is handed to the OS; without it
-// the address still shows the full callback URL). The plugin never sees the
-// callback itself — the user pastes the whole office-raccoon:// URL back —
-// so the state round-trip is the only proof this code came from a sign-in
-// this plugin started; it is compared verbatim before any exchange
-// (agent2api oauth.rs / parse_callback_code).
+// The vendor's desktop login: open the authorize page, the user signs in, and
+// the page builds `office-raccoon://auth/callback?code=…&state=…` in memory and
+// hands it to the OS via location.assign — with the official client installed
+// that deep-link opens the client; without it the navigation silently fails and
+// NOTHING is left in the address bar (verified against the live page's JS,
+// 2026-10: the SPA never navigates to a visible callback URL). So the plugin
+// cannot expect the pasted callback to come from the address bar; the workable
+// route is reading the one-time code from the page's own network response
+// (POST /api/web/auth/v1/authorization_code → {authorization_code, expires_in})
+// in DevTools. The plugin never sees the callback itself — the user pastes the
+// reconstructed office-raccoon:// URL (or the bare code) back — so the state
+// round-trip is the only proof this code came from a sign-in this plugin
+// started; it is compared verbatim before any exchange
+// (agent2api oauth.rs / parse_callback_code). agent2api's desktop app gets the
+// callback for free by intercepting navigation in its embedded webview
+// (src-tauri/src/login.rs on_navigation/on_new_window); a magpie plugin has no
+// browser shell, so there is nothing to intercept — hence the manual paste.
 
 const AUTHORIZE_PATH = "/code/authorize"
 const LOGIN_SOURCE = "desktop"
@@ -159,23 +168,23 @@ const newLoginState = () => crypto.randomUUID().replace(/-/g, "")
 // checking scheme/host/path and the state verbatim
 function parseCallback(raw, expectedState) {
   const text = String(raw ?? "").trim()
-  if (!text) return { error: "请粘贴登录后跳转的 office-raccoon:// 回调地址" }
+  if (!text) return { error: "请粘贴 office-raccoon:// 回调地址（或裸授权码，见登录指引第②步）" }
   // a bare code is accepted when the user copied just the code parameter
   if (!text.includes("://")) return { code: text }
   let url
   try {
     url = new URL(text)
   } catch {
-    return { error: "回调地址无法解析，请完整复制地址栏里的 office-raccoon:// 链接" }
+    return { error: "回调地址无法解析，请按登录指引拼出 office-raccoon://auth/callback?code=…&state=… 再粘贴" }
   }
   const ok =
     url.protocol === "office-raccoon:" &&
     url.hostname.toLowerCase() === "auth" &&
     url.pathname.replace(/\/+$/, "") === "/callback"
-  if (!ok) return { error: "这不是小浣熊的登录回调地址（应为 office-raccoon://auth/callback?…）" }
+  if (!ok) return { error: "这不是小浣熊的登录回调地址（应为 office-raccoon://auth/callback?code=…&state=…）" }
   const code = (url.searchParams.get("code") ?? "").trim()
   const state = (url.searchParams.get("state") ?? "").trim()
-  if (!code) return { error: "回调地址里没有授权码，请重新发起网页登录" }
+  if (!code) return { error: "回调地址里没有授权码：code= 后面应填 DevTools 里 authorization_code 响应的值" }
   if (!state) return { error: "回调地址里没有 state，无法确认这次登录由本机发起，请重新发起网页登录" }
   if (state !== expectedState) return { error: "回调 state 校验失败，请重新发起网页登录" }
   return { code }
@@ -519,8 +528,12 @@ export async function RaccoonAuthPlugin({ client } = {}) {
       return {
         url: authorizeUrl,
         instructions:
-          "浏览器打开上面的授权页并登录小浣熊。登录成功后页面会跳转 office-raccoon://auth/callback?code=…&state=…——" +
-          "装了小浣熊客户端时会提示打开客户端（取消即可），回调地址始终留在浏览器地址栏。把整条 office-raccoon:// 地址复制粘贴到下一步的输入框里。",
+          "① 浏览器打开上面的授权页并登录小浣熊。\n" +
+          "② 登录成功、页面显示「授权成功」后（未显示就点一下授权按钮），按 F12 打开开发者工具 → Network/网络面板，" +
+          "找到名为 authorization_code 的请求，从 Response/响应里复制 authorization_code 的值（一串长码）。\n" +
+          "③ 把整条 office-raccoon://auth/callback?code=刚才的码&state=" + state + " 粘贴到下面的输入框（也可只粘贴裸授权码）。\n" +
+          "授权码是一次性的、几分钟内有效；报「已失效」就回到授权页重新点一次授权，取新码再来。" +
+          "（本机装了小浣熊官方客户端时，登录后直接在地址栏复制 office-raccoon:// 回调地址亦可。）",
         method: "code",
         callback: async (pasted) => {
           const { code, error } = parseCallback(pasted, state)
