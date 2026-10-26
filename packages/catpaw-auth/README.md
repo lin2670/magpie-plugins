@@ -13,7 +13,8 @@ magpie plugin login catpaw     # 选「网页登录」/「妙手桌面端登录�
 
 ## 能力
 
-- **登录**：`网页登录`（无需妙手桌面端、无需 agent2api：插件问 `login-config` 取官方登录页，浏览器完成登录后插件按官方客户端同款 **poll-token 兜底通道**每秒轮询 `?sid` 直接拿 token——服务端对服务端，无监听端口、不受浏览器 PNA 拦截；再问一次 `current-user` 补 uid/昵称，失败不影响登录）、`妙手桌面端登录态`（每次请求前实时读 `~/.meituan-catpaw/auth.json`，mtime 缓存 5 分钟内；重开妙手即自动刷新）或 `手动粘贴 token`。
+- **登录**：`网页登录`（无需妙手桌面端、无需 agent2api：插件问 `login-config` 取官方登录页，浏览器完成登录后插件按官方客户端同款 **poll-token 兜底通道**每秒轮询 `?sid` 直接拿 token——服务端对服务端，无监听端口、不受浏览器 PNA 拦截；再问一次 `current-user` 补 uid/昵称，失败不影响登录。登录完成时浏览器会跳到 `127.0.0.1:9` 的打不开页面，**属预期行为**：token 走的是后台轮询通道，不依赖浏览器跳转成功）、`妙手桌面端登录态`（每次请求前实时读 `~/.meituan-catpaw/auth.json`，mtime 缓存 5 分钟内；重开妙手即自动刷新）或 `手动粘贴 token`。
+- **凭据归属（0.2.3 修复）**：只有 `妙手桌面端登录态` 的凭据存在客户端 auth.json 里；`网页登录` / `手动粘贴` 的账号**始终花自己存的 token**（0.2.2 及以前 `source === "manual"` 门会让网页登录回落读 auth.json——文件不存在时每请求必 401，token 明明有效也被 magpie 标成已退出登录）。
 - **无续期接口**：token 过期后 401，网页登录的重新发起一次即可；桌面端登录态则在妙手里重新登录（下一请求自动读新 token）。
 - **聊天**：`round → event → turn` 三步会话机；上游 SSE 帧为累积式，插件做差分转 OpenAI delta（`content` + `reasoning_content`），流式与非流式都支持。
 - **模型**：妙手桌面端的 9 个模型（longcat-2.0 / glm-5.3 系列 / deepseek-v4 系列 / minimax-m3 / kimi-k3 / auto），静态表（无远程目录接口）。

@@ -107,6 +107,45 @@ describe("sign-in methods", () => {
     expect(fake.state.pollCalls).toBeGreaterThanOrEqual(2)
     expect(fake.state.currentUserCalls).toBe(1)
   })
+
+  // regression (2026-10-26): the loader/usage gates used to read
+  // `a.source === "manual"`, so a stored web sign-in (`source: "web"`) fell
+  // through to the desktop auth.json read — which throws when the file is
+  // absent, and every request answered 401 with the web token still valid.
+  // A web (or manual) account must spend its own token; only the desktop
+  // method's credentials live in the client's auth.json.
+  test("a stored web sign-in spends its own token, never the desktop auth.json", async () => {
+    // the fake's webTokens models "tokens the vendor's poll-token handed out",
+    // which reset() clears; re-arm the stored web token as vendor-issued
+    fake.state.webTokens.add("web-cat-token")
+    saved = { type: "oauth", access: "web-cat-token", expires: 0, source: "web", accountId: "网页用户" }
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch("https://ai.catpaw.meituan.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "longcat-2.0", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json()).choices[0].message.content).toBe("你好，收到")
+    // round/event/turn each carried the web token, never the desktop file's
+    expect(fake.state.gatewayTokens.length).toBe(3)
+    expect(fake.state.gatewayTokens.every((t) => t === "web-cat-token")).toBe(true)
+
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.error).toBeUndefined()
+    expect(usage.windows[0].display).toBe("1134.67 credit")
+  })
+
+  test("the desktop source still reads the client's auth.json", async () => {
+    saved = { type: "oauth", access: "stale-web-token", expires: 0, source: "desktop", accountId: "Tester" }
+    const loader = await plugin.auth.loader(getAuth)
+    const res = await loader.fetch("https://ai.catpaw.meituan.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "longcat-2.0", stream: false, messages: [{ role: "user", content: "hi" }] }),
+    })
+    expect(res.status).toBe(200)
+    expect(fake.state.gatewayTokens.length).toBe(3)
+    expect(fake.state.gatewayTokens.every((t) => t === fake.state.token)).toBe(true)
+  })
 })
 
 describe("chat", () => {

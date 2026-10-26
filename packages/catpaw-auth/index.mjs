@@ -332,16 +332,19 @@ export async function CatPawAuthPlugin({ client } = {}) {
               return errorResponse(400, "this provider cannot run tools: the conversation protocol takes one flattened text prompt, so tool definitions would be silently dropped (refused rather than answered wrongly)")
             if (chat.messages.some((m) => m.role === "tool" || (Array.isArray(m.content) && m.content.some((c) => c?.type === "tool_call" || c?.type === "tool_use" || c?.type === "tool_result"))))
               return errorResponse(400, "this provider cannot continue a tool call: the conversation protocol takes one flattened text prompt, so tool results would be silently dropped (refused rather than answered wrongly)")
-            if (chat.messages.some((m) => Array.isArray(m.content) && m.content.some((c) => c?.type === "image" || (typeof c?.text === "string" && c.text.startsWith("data:image/")))))
+            if (chat.messages.some((m) => Array.isArray(m.content) && m.content.some((c) => c?.type === "image" || c?.type === "image_url" || c?.type === "input_image" || (typeof c?.text === "string" && c.text.startsWith("data:image/")))))
               return errorResponse(400, "this provider cannot take images through the text-only conversation prompt (refused rather than silently dropped)")
 
-            // the token: the desktop client's file, or the pasted one
+            // the token: only the desktop method's credentials live in the
+            // client's auth.json — a web sign-in or paste carries its own
+            // token in the account, and a request in account A's name must
+            // never be spent on whatever account the desktop app holds
             let token
-            let accountName = "妙手桌面端账号"
+            let accountName
             const a = await getAuth()
-            if (a?.type === "oauth" && a.access && a.source === "manual") {
+            if (a?.type === "oauth" && a.access && a.source !== "desktop") {
               token = a.access
-              accountName = a.name || a.accountId || "手动粘贴"
+              accountName = a.name || a.accountId || (a.source === "web" ? "妙手网页登录" : "手动粘贴")
             } else {
               try {
                 const file = readAuth()
@@ -430,7 +433,9 @@ export async function CatPawAuthPlugin({ client } = {}) {
       async usage(getAuth) {
         const a = await getAuth()
         let token
-        if (a?.type === "oauth" && a.access && a.source === "manual") token = a.access
+        // same split as the loader: only the desktop method reads the
+        // client's auth.json, every stored account spends its own token
+        if (a?.type === "oauth" && a.access && a.source !== "desktop") token = a.access
         else {
           try {
             token = readAuth().token
@@ -508,7 +513,7 @@ export async function CatPawAuthPlugin({ client } = {}) {
             return {
               url: url.href,
               instructions:
-                "浏览器打开上面的妙手登录页并完成登录。登录成功后本插件会自动拿到登录态（约几秒），无需手动输入任何东西；若长时间停在完成页，请回到 magpie 重试一次。",
+                "浏览器打开上面的妙手登录页并完成登录。登录成功后本插件会自动拿到登录态（约几秒），无需手动输入任何东西；登录完成时浏览器会跳到一个打不开的地址（127.0.0.1:9 的空白/错误页），这是预期行为，不用管它——登录态已通过后台通道送达；若长时间停在登录页没有反应，请回到 magpie 重试一次。",
               method: "auto",
               callback: async () => {
                 // poll-token every second until the browser login claims the

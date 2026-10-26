@@ -17,6 +17,7 @@ export function fakeCatPaw() {
     webTokens: new Set(), // tokens poll-token has handed out (current-user accepts these)
     pollCalls: 0,
     currentUserCalls: 0,
+    gatewayTokens: [], // the X-Passport-Token each conversation request carried
     reset() {
       state.conversations = []
       state.rounds = 0
@@ -28,6 +29,7 @@ export function fakeCatPaw() {
       state.webTokens = new Set()
       state.pollCalls = 0
       state.currentUserCalls = 0
+      state.gatewayTokens = []
     },
   }
   const server = Bun.serve({
@@ -40,7 +42,10 @@ export function fakeCatPaw() {
       // here with the real body (401 / code 4010)
       if (url.pathname === "/api/gateway/credit/balance") {
         state.balanceCalls++
-        if (req.headers.get("x-auth-token") !== state.token) return json(401, { code: 4010, message: "Authentication token is required", data: null, errorCode: null })
+        // a web sign-in's token is a vendor accessToken like any other: the
+        // balance endpoint accepts it under X-Auth-Token just the same
+        if (req.headers.get("x-auth-token") !== state.token && !state.webTokens?.has(req.headers.get("x-auth-token")))
+          return json(401, { code: 4010, message: "Authentication token is required", data: null, errorCode: null })
         return json(200, {
           code: 0,
           message: "success",
@@ -74,7 +79,8 @@ export function fakeCatPaw() {
       }
 
       const token = (req.headers.get("cookie") ?? "").match(/X-Passport-Token=(.+)/)?.[1] ?? ""
-      if (token !== state.token) return json(401, { code: 401, msg: "token refused" })
+      state.gatewayTokens.push(token)
+      if (token !== state.token && !state.webTokens?.has(token)) return json(401, { code: 401, msg: "token refused" })
       if (req.headers.get("m-appkey") !== "com.sankuai.mcopilot.cli") return json(400, { code: 400, msg: "m-appkey missing" })
 
       const body = await req.json().catch(() => ({}))
