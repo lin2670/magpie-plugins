@@ -1,0 +1,30 @@
+{
+  "name": "magpie-copilot-auth",
+  "version": "0.1.0",
+  "description": "magpie provider plugin: GitHub Copilot — device-flow sign-in, copilotToken exchange/refresh, chat via Copilot /responses and /chat/completions",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "magpie",
+    "copilot",
+    "github"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "bun test --preload ./nonet.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lin2670/magpie-plugins.git",
+    "directory": "packages/copilot-auth"
+  },
+  "bugs": {
+    "url": "https://github.com/lin2670/magpie-plugins/issues"
+  },
+  "homepage": "https://github.com/lin2670/magpie-plugins#readme"
+}
