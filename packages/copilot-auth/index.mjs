@@ -28,9 +28,12 @@ const NAME = "GitHub Copilot"
 
 // the GitHub API host is overridable apart from the chat gateway
 const GITHUB_API_BASE = () => process.env.COPILOT_GITHUB_API_BASE || "https://api.github.com"
-const GITHUB_DEVICE_URL = () => GITHUB_API_BASE() + "/login/device/code"
-const GITHUB_TOKEN_URL = () => GITHUB_API_BASE() + "/login/oauth/access_token"
-const GITHUB_TOKEN_INFO_URL = () => GITHUB_API_BASE() + "/copilot_internal/v2/token"
+// the device flow lives on github.com's own host, not the API host
+// (api.github.com/login/device/code answers 404), so it has its own base
+const GITHUB_WEB_BASE = () => process.env.COPILOT_GITHUB_WEB_BASE || "https://github.com"
+const GITHUB_DEVICE_URL = () => GITHUB_WEB_BASE() + "/login/device/code"
+const GITHUB_TOKEN_URL = () => GITHUB_WEB_BASE() + "/login/oauth/access_token"
+const COPILOT_TOKEN_URL = () => GITHUB_API_BASE() + "/copilot_internal/v2/token"
 const API_BASE = () => process.env.COPILOT_API_BASE || "https://api.githubcopilot.com"
 
 // the public device-flow client id of Copilot Chat (public by design, the
@@ -441,31 +444,20 @@ export async function CopilotAuthPlugin({ client } = {}) {
           type: "oauth",
           label: "GitHub 设备流登录（Device sign-in）",
           authorize: async () => {
-            let device
-            try {
-              device = await requestDeviceCode()
-            } catch (e) {
-              return { type: "failed", error: `无法连接 GitHub：${e?.message ?? e}` }
-            }
+            // authorize failures throw: magpie stores authorize's return as
+            // the sign-in session and calls its callback() verbatim, so a
+            // {type:"failed"} without a callback crashes the sign-in with
+            // "s.a.callback is not a function" instead of showing the error
+            const device = await requestDeviceCode()
             return {
               url: device.verification_uri ?? "https://github.com/login/device",
               instructions: `在浏览器打开上面的地址并输入代码 ${device.user_code} 完成授权（约 15 分钟内有效）。授权后本插件自动继续，无需手动输入。`,
               method: "auto",
               callback: async () => {
-                let githubToken
-                try {
-                  githubToken = await pollDeviceToken(device)
-                } catch (e) {
-                  return { type: "failed", error: String(e?.message ?? e) }
-                }
+                const githubToken = await pollDeviceToken(device)
                 // trade for the api token right away: a failed exchange
                 // should fail the sign-in, not the first chat
-                let first
-                try {
-                  first = await exchangeCopilotToken(githubToken)
-                } catch (e) {
-                  return { type: "failed", error: String(e?.message ?? e) }
-                }
+                const first = await exchangeCopilotToken(githubToken)
                 remember(tokenCache, githubToken, first)
                 // the GitHub login name for the account card; failing it
                 // does not fail the sign-in
@@ -503,21 +495,24 @@ export async function CopilotAuthPlugin({ client } = {}) {
           ],
           authorize: async (inputs) => {
             const githubToken = String(inputs?.token ?? "").trim()
-            if (!githubToken) return { type: "failed", error: "token 必填" }
-            let first
-            try {
-              first = await exchangeCopilotToken(githubToken)
-            } catch (e) {
-              return { type: "failed", error: `token 无法换取 Copilot 登录态：${e?.message ?? e}` }
-            }
+            if (!githubToken) throw new Error("token 必填")
+            // the exchange runs here so its error is this method's error;
+            // the success is handed back through a callback, which magpie's
+            // sign-in flow always calls (authorize's return is the session)
+            const first = await exchangeCopilotToken(githubToken)
             remember(tokenCache, githubToken, first)
             return {
-              type: "success",
-              refresh: githubToken,
-              access: first.access,
-              expires: first.expires,
-              accountId: "手动粘贴",
-              sku: first.sku,
+              url: "",
+              instructions: "",
+              method: "auto",
+              callback: async () => ({
+                type: "success",
+                refresh: githubToken,
+                access: first.access,
+                expires: first.expires,
+                accountId: "手动粘贴",
+                sku: first.sku,
+              }),
             }
           },
         },

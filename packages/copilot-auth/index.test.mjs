@@ -9,6 +9,7 @@ let CopilotAuthPlugin
 const origFetch = globalThis.fetch
 const origGatewayBase = process.env.COPILOT_API_BASE
 const origGitHubBase = process.env.COPILOT_GITHUB_API_BASE
+const origWebBase = process.env.COPILOT_GITHUB_WEB_BASE
 const origClientId = process.env.COPILOT_CLIENT_ID
 const origIntegrationId = process.env.COPILOT_INTEGRATION_ID
 const origCopilotBase = process.env.COPILOT_API_BASE
@@ -17,6 +18,7 @@ beforeAll(async () => {
   fake = fakeCopilot()
   process.env.COPILOT_API_BASE = fake.base
   process.env.COPILOT_GITHUB_API_BASE = fake.base
+  process.env.COPILOT_GITHUB_WEB_BASE = fake.base
   const mod = await import("./index.mjs")
   _internal = mod._internal
   CopilotAuthPlugin = mod.CopilotAuthPlugin
@@ -30,6 +32,8 @@ afterAll(() => {
   else process.env.COPILOT_API_BASE = origGatewayBase
   if (origGitHubBase === undefined) delete process.env.COPILOT_GITHUB_API_BASE
   else process.env.COPILOT_GITHUB_API_BASE = origGitHubBase
+  if (origWebBase === undefined) delete process.env.COPILOT_GITHUB_WEB_BASE
+  else process.env.COPILOT_GITHUB_WEB_BASE = origWebBase
   if (origClientId === undefined) delete process.env.COPILOT_CLIENT_ID
   else process.env.COPILOT_CLIENT_ID = origClientId
   if (origIntegrationId === undefined) delete process.env.COPILOT_INTEGRATION_ID
@@ -160,6 +164,65 @@ describe("catalog", () => {
     expect(modelsB["kimi-k3"]).toBeUndefined()
     expect(modelsB["gpt-4o"]).toBeDefined()
     expect(modelsAAgain["kimi-k3"]).toBeDefined()
+  })
+})
+
+describe("sign-in methods", () => {
+  // magpie's host stores authorize()'s return as the sign-in session and
+  // calls its callback() verbatim (0.1.2120): a return without a callback
+  // crashes with "s.a.callback is not a function", and authorize failures
+  // must throw so the real error reaches the user.
+  async function signInWith(method, inputs) {
+    const plugin = await createPlugin()
+    const m = plugin.auth.methods[method]
+    const session = await m.authorize(inputs)
+    if (!session || typeof session.callback !== "function")
+      throw new Error("authorize returned no callback")
+    return session.callback()
+  }
+
+  test("the device-flow method signs in through its callback", async () => {
+    fake.state.reset()
+    const plugin = await createPlugin()
+    const m = plugin.auth.methods[0]
+    const session = await m.authorize()
+    expect(typeof session.callback).toBe("function")
+    expect(session.method).toBe("auto")
+    expect(session.url).toBe("http://device")
+    // approve the pending device code, then let the poll find it
+    const code = [...fake.state.deviceCodes.keys()].at(-1)
+    fake.state.approve(code)
+    const r = await session.callback()
+    expect(r.type).toBe("success")
+    expect(r.refresh).toBe("gho_fake_user_token")
+    expect(r.access).toMatch(/^tid_/)
+    expect(r.accountId).toBe("fake-user")
+  })
+
+  test("an unreachable GitHub makes the device-flow authorize throw", async () => {
+    fake.state.reset()
+    const saved = process.env.COPILOT_GITHUB_WEB_BASE
+    process.env.COPILOT_GITHUB_WEB_BASE = "http://127.0.0.1:1"
+    try {
+      const plugin = await createPlugin()
+      await expect(plugin.auth.methods[0].authorize()).rejects.toThrow()
+    } finally {
+      if (saved === undefined) delete process.env.COPILOT_GITHUB_WEB_BASE
+      else process.env.COPILOT_GITHUB_WEB_BASE = saved
+    }
+  })
+
+  test("the paste-token method returns a session with a callback", async () => {
+    fake.state.reset()
+    const r = await signInWith(1, { token: "gho_fake_user_token" })
+    expect(r).toMatchObject({ type: "success", refresh: "gho_fake_user_token", accountId: "手动粘贴" })
+    expect(r.access).toMatch(/^tid_/)
+  })
+
+  test("a bad pasted token makes the paste method throw", async () => {
+    fake.state.reset()
+    const plugin = await createPlugin()
+    await expect(plugin.auth.methods[1].authorize({ token: "gho_revoked" })).rejects.toThrow("GitHub token 已失效")
   })
 })
 
