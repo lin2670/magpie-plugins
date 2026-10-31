@@ -437,12 +437,34 @@ describe("responses shapes", () => {
     })
     expect(streamRequest.status).toBe(200)
     expect(fake.state.chatBody.stream_options).toEqual({ include_usage: true })
+    // a URL-bearing input_image bridges onto chat's image_url part, in
+    // order, with the pure-text messages still a plain string
     const imageRequest = await loader.fetch(fake.base + "/responses", {
       method: "POST",
-      body: JSON.stringify({ model: "kimi-k3", input: [{ role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,abc" }] }] }),
+      body: JSON.stringify({
+        model: "kimi-k3",
+        input: [
+          { role: "user", content: ["看这张图", { type: "input_image", image_url: "data:image/png;base64,abc" }, "说完了吗"] },
+          { role: "user", content: "纯文本还在吗" },
+        ],
+      }),
     })
-    expect(imageRequest.status).toBe(400)
-    expect(await imageRequest.json()).toMatchObject({ error: { message: expect.stringContaining("input_image") } })
+    expect(imageRequest.status).toBe(200)
+    expect(fake.state.chatBody.messages[0].content).toEqual([
+      { type: "text", text: "看这张图" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+      { type: "text", text: "说完了吗" },
+    ])
+    expect(fake.state.chatBody.messages[1].content).toBe("纯文本还在吗")
+
+    // a file_id references the vendor's Files API, which the Copilot
+    // gateway doesn't expose — nothing can resolve it, so it stays 400
+    const fileIdRequest = await loader.fetch(fake.base + "/responses", {
+      method: "POST",
+      body: JSON.stringify({ model: "kimi-k3", input: [{ role: "user", content: [{ type: "input_image", file_id: "file-abc" }] }] }),
+    })
+    expect(fileIdRequest.status).toBe(400)
+    expect(await fileIdRequest.json()).toMatchObject({ error: { message: expect.stringContaining("file_id") } })
   })
 
   test("toResponses handles loader chat streaming, multiple calls, and incomplete upstream errors", async () => {

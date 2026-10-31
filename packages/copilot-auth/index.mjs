@@ -676,9 +676,25 @@ function messagesOf(body) {
     let content = ""
     if (typeof it.content === "string") content = it.content
     else if (Array.isArray(it.content)) {
-      const unsupported = it.content.find((part) => typeof part === "object" && part !== null && part.type !== "input_text" && part.type !== "text")
+      const unsupported = it.content.find(
+        (part) => typeof part === "object" && part !== null && part.type !== "input_text" && part.type !== "text" && part.type !== "input_image",
+      )
       if (unsupported) throw new Error(`聊天端点不支持 Responses 内容类型：${unsupported.type ?? "unknown"}`)
-      content = it.content.map((part) => (typeof part === "string" ? part : part?.text ?? "")).join("")
+      // input_image maps onto chat's image_url part in the original order
+      // (Responses keeps the url a bare string, chat wraps it in {url}).
+      // A file_id names a file of the vendor's Files API, which the
+      // Copilot gateway doesn't expose — nothing here can resolve it.
+      const parts = it.content.map((part) => {
+        if (typeof part === "string") return { type: "text", text: part }
+        if (part.type === "input_image") {
+          if (part.file_id != null) throw new Error("聊天端点不支持 file_id 引用的图片：Copilot 网关没有 Files API，请改为传图片 URL")
+          const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url
+          if (!url) throw new Error("input_image 缺少 image_url")
+          return { type: "image_url", image_url: { url } }
+        }
+        return { type: "text", text: part?.text ?? "" }
+      })
+      content = parts.some((part) => part.type === "image_url") ? parts : parts.map((part) => part.text).join("")
     }
     else if (it.content != null) content = String(it.content)
     out.push({ role, content })
