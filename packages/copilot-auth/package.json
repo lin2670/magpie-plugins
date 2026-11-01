@@ -1,6 +1,6 @@
 {
   "name": "magpie-copilot-auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "magpie provider plugin: GitHub Copilot — device-flow sign-in, copilotToken exchange/refresh, chat via Copilot /responses and /chat/completions",
   "type": "module",
   "main": "./index.mjs",

@@ -18,7 +18,7 @@ Magpie 将该插件显示为 `copilot-plugin`（与内置 `copilot` ID 冲突时
 3. **模型清单**：每次从上游 `/models` 动态探测（缓存 1 小时）并按账号权益过滤——模型有没有、叫什么，完全跟随账号，不做静态假表。过滤掉：`-free-auto` 诱饵（实测任何身份都 400）、completion/embedding 型、search/agent 内部型号。
 4. **聊天**：模型打哪个端点由它 `/models` 条目的 `supported_endpoints` 决定（同样动态）：
    - `gpt-5.6-luna` / `gpt-6-luna` 等 GPT-5.x/6.x 系 **只支持 `/responses`**（走 `/chat/completions` 会 400 `unsupported_api_for_model`）——magpie 侧声明为 Responses wire（`@ai-sdk/openai`），原生直通；
-   - `kimi-k3` / `gpt-4o` 等 **只支持 `/chat/completions`**——fetch 内将 Responses 输入、指令、工具历史及常用参数改写为 Chat 格式，回程再将文本/工具调用转回 Responses 格式（含 SSE）。
+   - `kimi-k3` / `gpt-4o` 等 **只支持 `/chat/completions`**——fetch 内将 Responses 输入、指令、工具历史及常用参数改写为 Chat 格式，回程再将文本/工具调用转回 Responses 格式（含 SSE）。URL 形式的 `input_image` 会按原顺序转换为 Chat 的 `image_url`；文本与图片混排使用数组，纯文本仍保持字符串。
 
 ## 身份（为什么是 visualstudio-chat）
 
@@ -42,10 +42,14 @@ Copilot 网关按 `Copilot-Integration-Id` 决定模型目录授权。实测（�
   一律转 `/chat/completions`。目录抓取失败时该账号使用最近一次成功目录；尚无缓存时只展示两账号共有的 gpt-4o 系列，直接请求则默认透传 `/responses`。
 - **usage（额度与重置时间）**：一次 `copilot_internal/v2/token` 调用同时带回登录态与额度——
   免费档响应里 `limited_user_quotas`（`{chat: 199, completions: 2000}`，**剩余量**：
-  2026-10-28 消费实测 200→199 确认语义）与 `limited_user_reset_date`（unix 秒）。
-  展示为两个窗口（`Chat 额度` / `补全额度`），各带 `resetsAt` 重置时间（ISO）。
-  付费档无这两个字段，卡片只显示套餐名。多账号各自独立计数（同插件实测 6 账号
+  2026-10-28 消费实测 200→199 确认语义）。展示为两个窗口（`Chat 额度` / `补全额度`），
+  各带 `resetsAt` 重置时间（ISO）。
+  **重置日是每月 1 日 00:00 UTC（北京时间 08:00）**，由插件计算；响应里的
+  `limited_user_reset_date` **不是**额度重置日（2026-11-01 实测：全部账号当天重置归满，
+  该字段仍显示 11-19/11-25/11-27 等按账号各异的日期），插件已弃用之。
+  付费档无额度字段，卡片只显示套餐名。多账号各自独立计数（同插件实测 6 账号
   6 份独立的 200 chat/月额度）。
+- **图片输入**：chat-only 模型支持 URL 形式的 `input_image`（裸 URL 或 `{url}`），插件会转换为 Chat 的 `image_url`；`file_id` 引用需要 Copilot 网关 Files API，无法解析时返回 400，请改传 URL。原生 `/responses` 模型的图片请求保持直通。
 - **Claude 系**：Copilot 对 Claude 走 `/v1/messages` 专用 shim，本插件未实现（v1 只覆盖 Responses/Chat 双协议）；需要 Claude 时在 OmniRoute 侧使用。
 - **TLS 拦截环境**：本机 Bun 曾遇到 `UNABLE_TO_VERIFY_LEAF_SIGNATURE`（安全软件 TLS
   拦截）；仅在可信本机的临时诊断命令中按需设置 `NODE_TLS_REJECT_UNAUTHORIZED=0`，
@@ -69,7 +73,7 @@ Copilot 网关按 `Copilot-Integration-Id` 决定模型目录授权。实测（�
 cd packages/copilot-auth && bun run test
 ```
 
-测试经 `nonet.mjs` 拦截非 loopback 网络请求，并连接本地 fake 上游（`fake.mjs`）。覆盖 token 交换、目录筛选、双端点协议改写、工具调用与流式完成；设备流协议格式另有测试，但 OAuth 插件钩子与真实 GitHub 登录仍需端到端验收。
+测试经 `nonet.mjs` 拦截非 loopback 网络请求，并连接本地 fake 上游（`fake.mjs`）。覆盖 token 交换、目录筛选、双端点协议改写、图片桥接、工具调用与流式完成；设备流协议格式另有测试，但 OAuth 插件钩子与真实 GitHub 登录仍需端到端验收。
 
 ## 许可
 

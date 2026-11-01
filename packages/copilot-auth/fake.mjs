@@ -113,9 +113,11 @@ export function fakeCopilot() {
           sku: "free_limited_copilot",
           tracking_id: "fake-tracking",
           // the real shape (measured 2026-10-28): plain numbers, what is LEFT
-          // of the free monthly allowance, plus a unix-seconds reset date
+          // of the free monthly allowance, plus a unix-seconds date that is
+          // NOT the quota reset (measured 2026-11-01: every account reset on
+          // the 1st while this field still named scattered per-account dates)
           limited_user_quotas: { chat: 199, completions: 2000 },
-          limited_user_reset_date: Math.floor(Date.now() / 1000) + 86400,
+          limited_user_reset_date: Math.floor(Date.UTC(2027, 5, 15) / 1000),
           endpoints: { api: "http://" + url.host },
         })
       }

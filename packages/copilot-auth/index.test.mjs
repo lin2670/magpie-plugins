@@ -242,9 +242,14 @@ describe("usage", () => {
     expect(chat.limit).toBe(200)
     expect(comp.display).toBe("2000 / 2000")
     expect(comp.amount).toBe(0)
-    // both windows carry the reset date as ISO
-    expect(new Date(chat.resetsAt).getTime()).toBeGreaterThan(Date.now())
-    expect(new Date(comp.resetsAt).getTime()).toBeGreaterThan(Date.now())
+    // the free quota resets monthly on the 1st, 00:00 UTC — NOT the
+    // upstream limited_user_reset_date field, which the fake pins to a
+    // non-month-start date to prove the plugin ignores it
+    const nextFirst = new Date()
+    nextFirst.setUTCMonth(nextFirst.getUTCMonth() + 1, 1)
+    nextFirst.setUTCHours(0, 0, 0, 0)
+    expect(chat.resetsAt).toBe(nextFirst.toISOString())
+    expect(comp.resetsAt).toBe(nextFirst.toISOString())
     // a clean read carries no signIn (magpie reads that as "sign-in fine")
     expect(out.signIn).toBeUndefined()
   })
@@ -339,6 +344,34 @@ describe("responses shapes", () => {
       { role: "system", content: "sys" },
       { role: "user", content: "hello world" },
     ])
+  })
+
+  test("messagesOf bridges image URLs and tolerates empty parts", () => {
+    expect(
+      _internal.messagesOf({
+        input: [
+          { role: "user", content: [{ type: "input_text", text: "看图" }, { type: "input_image", image_url: { url: "https://example.com/cat.png" } }, null] },
+          { role: "user", content: [{ type: "input_image", image_url: "http://example.com/dog.png" }] },
+        ],
+      }),
+    ).toEqual([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "看图" },
+          { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
+          { type: "text", text: "" },
+        ],
+      },
+      { role: "user", content: [{ type: "image_url", image_url: { url: "http://example.com/dog.png" } }] },
+    ])
+    expect(_internal.messagesOf({ input: [{ role: "user", content: ["a", null] }] })).toEqual([{ role: "user", content: "a" }])
+  })
+
+  test("messagesOf rejects unresolved or unsupported image content", () => {
+    expect(() => _internal.messagesOf({ input: [{ role: "user", content: [{ type: "input_image" }] }] })).toThrow("input_image 缺少 image_url")
+    expect(() => _internal.messagesOf({ input: [{ role: "user", content: [{ type: "input_image", file_id: "file-abc" }] }] })).toThrow("file_id")
+    expect(() => _internal.messagesOf({ input: [{ role: "user", content: [{ type: "input_audio" }] }] })).toThrow("聊天端点不支持 Responses 内容类型")
   })
 
   test("toolsOf wraps function tools and rejects hosted tools", () => {

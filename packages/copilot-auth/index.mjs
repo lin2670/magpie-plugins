@@ -163,7 +163,6 @@ async function exchangeCopilotToken(githubToken, base) {
     expires: (j.expires_at ?? Math.floor(Date.now() / 1000) + 1500) * 1000,
     sku: j.sku,
     limited_user_quotas: j.limited_user_quotas,
-    limited_user_reset_date: j.limited_user_reset_date,
     trackingId: j.tracking_id,
     endpoints: j.endpoints,
   }
@@ -398,19 +397,25 @@ export async function CopilotAuthPlugin({ client } = {}) {
             expires_at: info.expires / 1000,
             sku: info.sku,
             limited_user_quotas: info.limited_user_quotas,
-            limited_user_reset_date: info.limited_user_reset_date,
           }
           remember(tokenCache, githubToken, info)
 
           const plan = j.sku === "free_limited_copilot" ? "Copilot Free" : NAME
           const left = j.limited_user_quotas ?? null
-          const resetSec = j.limited_user_reset_date ?? 0
           if (!left) {
             // paid SKU: no metered window to show
             return { plan, user: auth.accountId || auth.uid || "Copilot 账号", windows: [] }
           }
           // the free allowance's full size, by window key
           const FULL = { chat: 200, completions: 2000 }
+          // the free quota resets monthly on the 1st, 00:00 UTC (measured
+          // 2026-11-01: every account reset on the 1st while the exchange's
+          // limited_user_reset_date still named scattered per-account dates —
+          // that field is not the quota reset, so the date is computed here)
+          const nextFirst = new Date()
+          nextFirst.setUTCMonth(nextFirst.getUTCMonth() + 1, 1)
+          nextFirst.setUTCHours(0, 0, 0, 0)
+          const resetsAt = nextFirst.toISOString()
           const windows = []
           const names = { chat: "Chat 额度", completions: "补全额度" }
           for (const key of Object.keys(FULL)) {
@@ -426,7 +431,7 @@ export async function CopilotAuthPlugin({ client } = {}) {
               display: `${remaining} / ${total}`,
               aside: true,
             }
-            if (resetSec > 0) w.resetsAt = new Date(resetSec * 1000).toISOString()
+            w.resetsAt = resetsAt
             windows.push(w)
           }
           return {
@@ -676,23 +681,20 @@ function messagesOf(body) {
     let content = ""
     if (typeof it.content === "string") content = it.content
     else if (Array.isArray(it.content)) {
-      const unsupported = it.content.find(
-        (part) => typeof part === "object" && part !== null && part.type !== "input_text" && part.type !== "text" && part.type !== "input_image",
-      )
-      if (unsupported) throw new Error(`聊天端点不支持 Responses 内容类型：${unsupported.type ?? "unknown"}`)
       // input_image maps onto chat's image_url part in the original order
       // (Responses keeps the url a bare string, chat wraps it in {url}).
       // A file_id names a file of the vendor's Files API, which the
       // Copilot gateway doesn't expose — nothing here can resolve it.
       const parts = it.content.map((part) => {
-        if (typeof part === "string") return { type: "text", text: part }
+        if (typeof part === "string" || part == null) return { type: "text", text: typeof part === "string" ? part : "" }
         if (part.type === "input_image") {
           if (part.file_id != null) throw new Error("聊天端点不支持 file_id 引用的图片：Copilot 网关没有 Files API，请改为传图片 URL")
           const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url
           if (!url) throw new Error("input_image 缺少 image_url")
           return { type: "image_url", image_url: { url } }
         }
-        return { type: "text", text: part?.text ?? "" }
+        if (part.type === "input_text" || part.type === "text") return { type: "text", text: part.text ?? "" }
+        throw new Error(`聊天端点不支持 Responses 内容类型：${part.type ?? "unknown"}`)
       })
       content = parts.some((part) => part.type === "image_url") ? parts : parts.map((part) => part.text).join("")
     }
