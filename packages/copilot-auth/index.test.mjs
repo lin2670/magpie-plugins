@@ -500,6 +500,43 @@ describe("responses shapes", () => {
     expect(await fileIdRequest.json()).toMatchObject({ error: { message: expect.stringContaining("file_id") } })
   })
 
+  test("a replayed item from another connection is retried without it", async () => {
+    fake.state.reset()
+    fake.state.foreignItemIds = true
+    const plugin = await createPlugin()
+    const loader = await plugin.auth.loader(async () => asAuth("ghu_resumed"))
+    const body = {
+      model: "gpt-6-luna",
+      input: [
+        { type: "reasoning", id: "rs_old", summary: [] },
+        { type: "message", id: "msg_old", role: "user", content: [{ type: "input_text", text: "continue" }] },
+      ],
+    }
+    const response = await loader.fetch(fake.base + "/responses", { method: "POST", body: JSON.stringify(body) })
+    expect(response.status).toBe(200)
+    // the upstream saw the replay refused, then the same turn without it
+    expect(fake.state.requestUrls).toHaveLength(2)
+    const resent = fake.state.responseBodies.at(-1)
+    expect(resent.input).toEqual([{ type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] }])
+
+    // the account is marked: the next turn strips up front, one call only
+    const again = await loader.fetch(fake.base + "/responses", { method: "POST", body: JSON.stringify(body) })
+    expect(again.status).toBe(200)
+    expect(fake.state.requestUrls).toHaveLength(3)
+  })
+
+  test("an unrelated 401 is answered as it came, not retried", async () => {
+    fake.state.reset()
+    const plugin = await createPlugin()
+    const loader = await plugin.auth.loader(async () => ({ type: "oauth", refresh: "gho_revoked", access: "", expires: 0 }))
+    const response = await loader.fetch(fake.base + "/responses", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-6-luna", input: [{ type: "message", role: "user", content: "hi" }] }),
+    })
+    expect(response.status).toBe(401)
+    expect(fake.state.requestUrls).toHaveLength(0)
+  })
+
   test("toResponses handles loader chat streaming, multiple calls, and incomplete upstream errors", async () => {
     fake.state.reset()
     const plugin = await createPlugin()

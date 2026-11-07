@@ -50,6 +50,10 @@ Copilot 网关按 `Copilot-Integration-Id` 决定模型目录授权。实测（�
   付费档无额度字段，卡片只显示套餐名。多账号各自独立计数（同插件实测 6 账号
   6 份独立的 200 chat/月额度）。
 - **图片输入**：chat-only 模型支持 URL 形式的 `input_image`（裸 URL 或 `{url}`），插件会转换为 Chat 的 `image_url`；`file_id` 引用需要 Copilot 网关 Files API，无法解析时返回 400，请改传 URL。原生 `/responses` 模型的图片请求保持直通。
+- **`/responses` 的会话归属**：Copilot 按连接（api token / 账号）校验回放的 input item，id 或 reasoning 载荷来自别的连接时答
+  `401 input item does not belong to this connection`（Codex 续聊最常撞，因 token 约 30 分钟轮换、多账号还会 failover）。
+  插件收到这条 401 会把该轮的 connection 状态剥掉（丢 reasoning item、去掉各 item 的 `id`/`status`、
+  去掉 `previous_response_id`）重发一次；该账号此后每轮都先剥再发，不再多付一次 401 往返。
 - **Claude 系**：Copilot 对 Claude 走 `/v1/messages` 专用 shim，本插件未实现（v1 只覆盖 Responses/Chat 双协议）；需要 Claude 时在 OmniRoute 侧使用。
 - **TLS 拦截环境**：本机 Bun 曾遇到 `UNABLE_TO_VERIFY_LEAF_SIGNATURE`（安全软件 TLS
   拦截）；仅在可信本机的临时诊断命令中按需设置 `NODE_TLS_REJECT_UNAUTHORIZED=0`，

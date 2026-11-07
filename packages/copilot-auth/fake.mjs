@@ -14,6 +14,8 @@ export function fakeCopilot() {
     catalogCalls: 0,
     catalogTokens: [],
     chatBody: null,
+    responseBodies: [],
+    foreignItemIds: false,
     streamChat: false,
     streamToolCalls: false,
     reset() {
@@ -24,6 +26,8 @@ export function fakeCopilot() {
       state.catalogCalls = 0
       state.catalogTokens = []
       state.chatBody = null
+      state.responseBodies = []
+      state.foreignItemIds = false
       state.streamChat = false
       state.streamToolCalls = false
       state.account = "default"
@@ -136,6 +140,13 @@ export function fakeCopilot() {
         if (!auth.startsWith("Bearer tid_")) return json(401, { error: { message: "no token" } })
         const b = await req.json()
         state.modelCalls.push({ endpoint: "/responses", model: b.model })
+        state.responseBodies.push(b)
+        // a replayed item id or reasoning item from another connection, as
+        // the real upstream answers it (measured: Codex resuming a session)
+        if (state.foreignItemIds) {
+          const replayed = (b.input ?? []).some((it) => it && typeof it === "object" && (it.id || it.type === "reasoning"))
+          if (replayed) return json(401, { error: { message: "GitHub Copilot: input item does not belong to this connection" } })
+        }
         if (b.model === "kimi-k3") return json(400, { error: { message: "model not on /responses", code: "unsupported_api_for_model" } })
         if (b.stream) {
           return new Response(

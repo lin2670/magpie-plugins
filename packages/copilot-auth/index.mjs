@@ -251,12 +251,21 @@ export async function CopilotAuthPlugin({ client } = {}) {
   const catalogs = new Map()
   const tokenCache = new Map()
   const renewing = new Map()
+  const foreignItems = new Set() // GitHub tokens whose /responses refused replayed item ids
   const CACHE_LIMIT = 16
 
   const remember = (cache, key, value) => {
     cache.delete(key)
     cache.set(key, value)
     if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value)
+  }
+
+  // once an account's /responses has refused replayed items, its next
+  // requests strip them up front instead of paying a 401 round trip each turn
+  const noteForeignItems = (githubToken) => {
+    foreignItems.delete(githubToken)
+    foreignItems.add(githubToken)
+    if (foreignItems.size > CACHE_LIMIT) foreignItems.delete(foreignItems.values().next().value)
   }
 
   async function getCatalog(githubToken, apiToken) {
@@ -350,7 +359,7 @@ export async function CopilotAuthPlugin({ client } = {}) {
               }
             }
 
-            return forward(input, init, token, entry)
+            return forward(input, init, token, entry, foreignItems.has(githubToken), () => noteForeignItems(githubToken))
           },
         }
       },
@@ -582,12 +591,64 @@ function pathModelName(pathname, body) {
   }
 }
 
+// Copilot's /responses keeps input items per connection: an item id, or a
+// reasoning payload, minted under an earlier api token — or by another
+// account in the failover pool — is refused when the client replays it
+// (Codex does, turn after turn):
+//   401 "input item does not belong to this connection"
+// Replaying the same conversation with that connection-scoped state stripped
+// makes the upstream read the items as fresh content.
+const FOREIGN_ITEM = /does not belong to this connection/i
+
+// strippedOfForeignItems drops what only the connection that minted it can
+// read: reasoning items (provider state), every item's id/status, and a
+// previous_response_id. Nothing changed → null, so the caller keeps the body.
+function strippedOfForeignItems(raw) {
+  let body
+  try {
+    body = JSON.parse(raw || "{}")
+  } catch {
+    return null
+  }
+  let changed = false
+  if (Array.isArray(body.input)) {
+    const kept = []
+    for (const item of body.input) {
+      if (!item || typeof item !== "object") {
+        kept.push(item)
+        continue
+      }
+      if (item.type === "reasoning") {
+        changed = true
+        continue
+      }
+      const next = { ...item }
+      for (const key of ["id", "status"]) {
+        if (key in next) {
+          delete next[key]
+          changed = true
+        }
+      }
+      kept.push(next)
+    }
+    body.input = kept
+  }
+  if (body.previous_response_id) {
+    delete body.previous_response_id
+    changed = true
+  }
+  return changed ? JSON.stringify(body) : null
+}
+
 // forward sends the request upstream with the fresh token, rewriting the
 // wire for models whose catalog entry says /chat/completions.
-async function forward(input, init, token, entry) {
+async function forward(input, init, token, entry, stripIds = false, onForeign) {
   const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
   const u = new URL(url)
-  const raw = await bodyText(input, init)
+  const rawIn = await bodyText(input, init)
+  // a token marked foreign already: strip the connection state up front
+  const replay = stripIds ? strippedOfForeignItems(rawIn) : null
+  const raw = replay ?? rawIn
   const requestPath = u.pathname.replace(/\/+$/, "")
   if (requestPath === "/chat/completions") {
     return fetch(API_BASE() + u.pathname + u.search, {
@@ -647,6 +708,23 @@ async function forward(input, init, token, entry) {
     body: raw,
     signal: init.signal,
   })
+  // a replayed item from another connection: say so once, then ask again
+  // with the connection-scoped state stripped
+  if (upstream.status === 401) {
+    const said = await upstream.clone().text().catch(() => "")
+    if (FOREIGN_ITEM.test(said)) {
+      onForeign?.()
+      const fixed = replay ?? strippedOfForeignItems(raw)
+      if (fixed) {
+        upstream = await fetch(API_BASE() + u.pathname + u.search, {
+          method: init.method ?? "POST",
+          headers: apiHeaders(token),
+          body: fixed,
+          signal: init.signal,
+        })
+      }
+    }
+  }
   return upstream
 }
 
