@@ -14,7 +14,7 @@ magpie plugin login raccoon     # 选「网页登录」/「从 agent2api 导入�
 ## 能力
 
 - **登录**：`网页登录`（无需 agent2api：打开小浣熊官方授权页登录，再从 DevTools Network 面板读 `authorization_code` 响应里的授权码，拼成 `office-raccoon://auth/callback?code=…&state=…` 粘回来（裸授权码亦可），state 逐字校验后经 `login_with_authorization_code` 换 token 对；授权码一次性，200035=已失效需重新点授权取新码。官方 SPA 登录成功后只在内存里拼回调地址并尝试唤起客户端——没装官方客户端时地址栏不会有任何回调链接，因此只能从 DevTools 取码）、`从 agent2api 导入`（读本机 `~/.agent2api/agent2api.db`，只读不写回；多账号时列表选择）或 `手动粘贴 token`。
-- **续期**：accessToken 临期 5 分钟自动刷新（`POST /api/web/auth/v1/refresh`；响应 `refresh_token` 为空时沿用旧值）。请求中途 401 也会强制续期一次并重试。
+- **续期**：小浣熊回的 `access_token` 与 `refresh_token` 是**同一个 JWT**（同 jti、同 exp，30 天），所以续期只能在 JWT 还有效时滚动换新——一旦越过 exp，`POST /api/web/auth/v1/refresh` 直接 401 `authorization_verify_error`，无法自救。因此长寿命 token（≥7 天）改为**滚动续期**：寿命用掉 1/6（30 天里的第 5 天）后，下一次使用即换新并把窗口前移，日常使用永远不会撞到过期；短寿命 token 仍按临期 5 分钟刷新（无 iat/exp 可测算时也回落到这 5 分钟）。响应 `refresh_token` 为空时沿用旧值；请求中途 401 也会强制续期一次并重试。
 - **聊天**：`POST {llmBase}/chat/completions`，OpenAI 兼容 body 原样透传，SSE 流式；上游回帧中的 `model` 名回写为请求名。
 - **模型**：`GET {llmBase}/model_catalog`（失败回落静态清单 5 个；重复名首个生效）。
 - **余额（usage）**：`GET /api/web/points/v1/balance` + `entitlement_info`。

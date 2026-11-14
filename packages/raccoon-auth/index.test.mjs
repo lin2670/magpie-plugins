@@ -188,6 +188,57 @@ describe("refresh", () => {
   })
 })
 
+describe("rolling renewal", () => {
+  // a JWT shaped like the vendor's: { iat, exp } with a settable life
+  const jwt = (ageMs, lifeMs) => {
+    const now = Date.now()
+    const iat = Math.floor((now - ageMs) / 1000)
+    const exp = Math.floor((now - ageMs + lifeMs) / 1000)
+    return `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ iat, exp })).toString("base64url")}.x`
+  }
+  const day = 86_400_000
+  const withToken = (ageMs, lifeMs) => {
+    const access = jwt(ageMs, lifeMs)
+    const exp = _internal.jwtEnd(access)
+    saved = { type: "oauth", access, refresh: "refresh-1", expires: exp, name: "Tester" }
+    fake.state.access = access // the fake upstream accepts what magpie was given
+    return { access, exp }
+  }
+
+  test("a token that has used only a small part of its life is kept", async () => {
+    const { exp } = withToken(1 * day, 30 * day) // 29 of 30 days left
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.signIn).toBe("kept")
+    expect(fake.state.refreshCalls).toBe(0)
+    expect(saved.expires).toBe(exp)
+  })
+
+  test("a 30-day token is rolled once its first sixth is spent", async () => {
+    withToken(6 * day, 30 * day) // 24 days left < 5/6 of the life
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.signIn).toBe("kept")
+    expect(fake.state.refreshCalls).toBe(1)
+    expect(saved.access).toBe("access-2")
+  })
+
+  test("a short-lived token keeps the near-expiry lead", async () => {
+    withToken(10 * 60_000, 60 * 60_000) // 50 minutes left of an hour
+    await plugin.auth.usage(getAuth)
+    expect(fake.state.refreshCalls).toBe(0)
+    withToken(58 * 60_000, 60 * 60_000) // 2 minutes left
+    await plugin.auth.usage(getAuth)
+    expect(fake.state.refreshCalls).toBe(1)
+  })
+
+  test("the window is a sixth of the life, floored and capped by the span", () => {
+    const thirtyDays = 30 * 86_400_000
+    expect(_internal.renewWindow(jwt(0, thirtyDays))).toBe(Math.floor((thirtyDays * 5) / 6))
+    // no iat/exp to size a roll from: the old five-minute lead
+    expect(_internal.renewWindow("not-a-jwt")).toBe(5 * 60_000)
+    expect(_internal.jwtLife("not-a-jwt")).toBe(0)
+  })
+})
+
 describe("checkin", () => {
   test("triggers the grant and reads it back as claimed", async () => {
     const result = await plugin.auth.checkin(getAuth)

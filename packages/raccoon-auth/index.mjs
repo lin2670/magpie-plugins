@@ -41,8 +41,24 @@ async function agent2apiAccounts(providerId) {
 const ID = "raccoon"
 const NAME = "小浣熊 Raccoon"
 
-// how long before its end an access token is renewed (agent2api's window)
+// how long before its end a token is renewed when its JWT carries no usable
+// iat/exp span to size a rolling renewal from (agent2api's window)
 const REFRESH_LEAD = 5 * 60_000
+
+// The vendor hands back ONE JWT and that same string is both the access and
+// the refresh token (identical bytes, same jti and exp — checked against live
+// tokens 2026-11-14). A renewal therefore only works while the JWT is still
+// valid: there is no long-lived refresh token to fall back on, and once exp
+// passes POST /refresh answers 401 `authorization_verify_error` for good.
+// Renewing in the last five minutes only (the old behaviour) let any account
+// that sat idle for a few hours die silently — RaccoonNatalie's 30-day token
+// lapsed at 21:24 after its last request at 15:57, and the account stayed
+// signed out until a manual web sign-in. Long-lived tokens are now rolled
+// early instead: once a sixth of the life is spent (5 of 30 days) the next
+// use renews it and the window slides forward, so daily use never meets the
+// expiry cliff.
+const LONG_TOKEN_LIFE_MS = 7 * 86_400_000
+const ROLL_AFTER_FRACTION = 1 / 6
 
 // the three sites, each overridable through the same env vars agent2api reads
 const env = (name, fallback) => {
@@ -70,6 +86,26 @@ function jwtEnd(token) {
 const toInt = (v) => {
   const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN
   return Number.isFinite(n) ? Math.floor(n) : null
+}
+
+// a JWT's lifetime in ms (exp − iat); 0 when either claim is missing
+function jwtLife(token) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(token).split(".")[1], "base64url").toString("utf8"))
+    const exp = typeof payload?.exp === "number" ? payload.exp : 0
+    const iat = typeof payload?.iat === "number" ? payload.iat : 0
+    return exp > iat ? (exp - iat) * 1000 : 0
+  } catch {
+    return 0
+  }
+}
+
+// how much of a token's life may still be left before the next use renews it:
+// a long-lived JWT is rolled once its first sixth is spent (5 of 30 days,
+// see LONG_TOKEN_LIFE_MS), anything shorter keeps the near-expiry lead
+function renewWindow(token) {
+  const life = jwtLife(token)
+  return life >= LONG_TOKEN_LIFE_MS ? Math.floor(life * (1 - ROLL_AFTER_FRACTION)) : REFRESH_LEAD
 }
 
 // the vendor's day runs on Beijing time (agent2api core::beijing)
@@ -305,13 +341,13 @@ export async function RaccoonAuthPlugin({ client } = {}) {
     return got
   }
 
-  // fresh is the account with a live access token, renewed near its end and
-  // saved back
+  // fresh is the account with a live access token, renewed once its rolling
+  // window is used up (see LONG_TOKEN_LIFE_MS) and saved back
   const fresh = (getAuth) =>
     locked(async () => {
       const a = await getAuth()
       if (a?.type !== "oauth" || !a.access) throw new SignedOut("小浣熊：未登录")
-      if (a.expires && a.expires - Date.now() > REFRESH_LEAD) return a
+      if (a.expires && a.expires - Date.now() > renewWindow(a.access)) return a
       const next = { ...a, ...(await renewOf(a)) }
       await client.auth.set({ path: { id: ID }, body: next })
       return next
@@ -714,6 +750,8 @@ export const _internal = {
   parseCallback,
   exchangeWebCode,
   jwtEnd,
+  jwtLife,
+  renewWindow,
   stripBearer,
   toInt,
   beijingToday,
