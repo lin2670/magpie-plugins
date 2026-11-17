@@ -380,7 +380,14 @@ export async function LoomyAuthPlugin({ client } = {}) {
               type: "success",
               refresh: "",
               access: session,
-              expires: Date.now() + 14 * 86400e3, // the session the client asks for is 14 days
+              // no refresh token and no disclosed session lifetime — the
+              // checkCode call's `expire: 1209600` is the SMS code's window,
+              // not the session's. A session issued 2026-10-30 was still
+              // answering 000000 on 2026-11-17, so any client-side clock (the
+              // old +14d guess) just lapsed live accounts; expiry stays 0 and
+              // the upstream's 401 is the only death signal (catpaw's pattern
+              // for refresh-less sessions)
+              expires: 0,
               accountId: `${phone.slice(0, 3)}****${phone.slice(-4)}`,
               userId: String(answer?.data?.userid ?? ""),
               source: "sms",
@@ -395,7 +402,7 @@ export async function LoomyAuthPlugin({ client } = {}) {
   methods.push({
     type: "oauth",
     label: "手动粘贴 session（Paste token）",
-    prompts: [{ type: "text", key: "session", message: "session（token 头的值，14 天有效）", validate: (v) => (v && v.trim() ? undefined : "必填") }],
+    prompts: [{ type: "text", key: "session", message: "session（token 头的值）", validate: (v) => (v && v.trim() ? undefined : "必填") }],
     authorize: async (inputs) => {
       const session = String(inputs?.session ?? "").trim()
       if (!session) return { type: "failed", error: "session 必填" }

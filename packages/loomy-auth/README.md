@@ -13,8 +13,8 @@ magpie plugin login loomy     # 选「从 agent2api 导入」/「短信验证码
 
 ## 能力
 
-- **登录**：`从 agent2api 导入`（只读本机 `~/.agent2api/agent2api.db`）或 `短信验证码登录`（发码 → 输入 6 位码完成，session **14 天**）或 `手动粘贴 session`。
-- **无续期接口**：session 过期（业务码 `020002`/`100002`）需重新登录（短信或再导入）。
+- **登录**：`从 agent2api 导入`（只读本机 `~/.agent2api/agent2api.db`）或 `短信验证码登录`（发码 → 输入 6 位码完成）或 `手动粘贴 session`。
+- **无续期接口、无客户端时钟**：session 寿命上游不披露且远超旧文档的 14 天（2026-10-30 签发的 session 在 2026-11-17 仍有效），所以 `expires` 恒为 0——magpie 永不因自猜的时钟把账号标 lapsed，只有上游业务码 `020002`/`100002`（401）才算真失效，需重新登录（短信或再导入）。
 - **聊天**：`POST {积分基址}/api/v1/chat/completions`，OpenAI 兼容，`token` + `Authorization: Bearer` 双头，SSE 直通。
   - 思考档折叠：通用档位折成 `reasoning_effort: low|medium|high`（minimal/low→low，high/max→high，none 不注入）。
   - 图片适配：**deepseek 系模型**只认 `<image_base64>` 标记——data URI 图片块自动转标记并并入前一个文本块；http(s) URL 保持原样。其余模型保持 OpenAI `image_url`。

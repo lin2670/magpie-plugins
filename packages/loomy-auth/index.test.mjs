@@ -56,7 +56,7 @@ describe("sign-in methods", () => {
     expect(result.source).toBe("agent2api")
   })
 
-  test("SMS: sends the code, then trades it for a 14-day session", async () => {
+  test("SMS: sends the code, then trades it for a session with no client-side clock", async () => {
     const method = plugin.auth.methods.find((m) => m.label.includes("SMS"))
     const flow = await method.authorize({ phone: "138 0013 8000" }) // spaces tolerated
     expect(flow.method).toBe("code")
@@ -67,8 +67,21 @@ describe("sign-in methods", () => {
     const result = await flow.callback("123456")
     expect(result.type).toBe("success")
     expect(result.access).toBe("sess-1")
-    expect(result.expires).toBeGreaterThan(Date.now() + 13 * 86400e3)
+    // no refresh token and no known session lifetime: expiry stays 0 so
+    // magpie never lapses the account on its own clock — a live session
+    // keeps working until the upstream says otherwise (catpaw's pattern;
+    // the 14-day guess lapsed a 34-day-old live session on 2026-11-17)
+    expect(result.expires).toBe(0)
+    expect(result.refresh).toBe("")
     expect(result.accountId).toBe("138****8000")
+  })
+
+  test("paste: a session outlives any client-side clock the same way", async () => {
+    const method = plugin.auth.methods.find((m) => m.label.includes("Paste"))
+    const result = await method.authorize({ session: "pasted" })
+    expect(result.type).toBe("success")
+    expect(result.access).toBe("pasted")
+    expect(result.expires).toBe(0)
   })
 
   test("SMS: an invalid phone is refused before anything is sent", async () => {
@@ -83,6 +96,16 @@ describe("sign-in methods", () => {
     const result = await method.authorize({ session: "pasted" })
     expect(result.type).toBe("success")
     expect(result.access).toBe("pasted")
+  })
+
+  test("an account clock-lapsed beyond any guess still reports usage fine (the 2026-11-17 lapse)", async () => {
+    // a session from 34 days before its "14-day" expires: the upstream still
+    // answers 000000, so usage must not say expired — the mark magpie put on
+    // the account from the stale expires field has to come back off
+    saved = { type: "oauth", access: fake.state.session, expires: Date.now() - 20 * 86400e3, accountId: "138****8000", name: "138****8000", source: "sms" }
+    const u = await plugin.auth.usage(getAuth)
+    expect(u.windows?.length).toBe(2)
+    expect(u.signIn).toBeUndefined()
   })
 })
 
