@@ -13,6 +13,10 @@ function jwt(exp, userId, deviceId) {
   return `${enc({ alg: "HS256", typ: "JWT" })}.${enc({ user_id: userId, device_id: deviceId, exp })}.sig`
 }
 
+// an ISO timestamp in the vendor's ledger shape (`+08:00`), so every row's
+// Beijing day is unambiguous
+const beijingIso = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().replace(/\.\d+Z$/, "+08:00")
+
 const APP_ID = "100003"
 const APP_KEY = "38d2391985e2369a5fb8227d8e6cd5e5"
 
@@ -33,15 +37,38 @@ export function fakeAutoClaw() {
     // when true, /userapi/v1/refresh answers 400002 and the plugin must
     // degrade to /userapi/v1/agent-refresh
     refreshNeedsFallback: false,
+    // user-info: a non-zero code models a failed login event (the plugin must
+    // not treat it as reached)
+    userInfoCode: 0,
+    // the wallets payload (null = the default three wallets)
+    walletTotal: 12700,
+    walletRows: null,
+    // task-list answering: normal | empty | error | quota | banned
+    taskListMode: "normal",
+    // the campaign ledger rows and an HTTP status to fail with
+    campaignEntries: [],
+    ledgerStatus: 0,
+    // the login hook: when set, a successful user-info pays one today-dated
+    // activity credit into the ledger (amount / description configurable) —
+    // the vendor's auto-grant, so the check-in's read-back has something to see
+    creditOnUserInfo: null,
+    creditOnUserInfoPaid: false,
+    // a chat refusal to model: null | "quota" | "banned" | 401 (proxy HTTP status)
+    chatRefusal: null,
+    proxyStatus: 0,
     sendCodeCalls: [],
     loginCalls: [],
     refreshCalls: [],
     agentRefreshCalls: [],
     taskCalls: [],
+    taskListCalls: 0,
+    userInfoCalls: [],
+    ledgerCalls: 0,
     walletCalls: 0,
     chatCalls: [],
     catalogCalls: 0,
     lastUserapiHeaders: null,
+    lastUserInfoHeaders: null,
     lastProxyHeaders: null,
     lastAuthHeader: null,
     reset() {
@@ -50,15 +77,29 @@ export function fakeAutoClaw() {
       state.signinError = 0
       state.inspirationError = 0
       state.refreshNeedsFallback = false
+      state.userInfoCode = 0
+      state.walletTotal = 12700
+      state.walletRows = null
+      state.taskListMode = "normal"
+      state.campaignEntries = []
+      state.ledgerStatus = 0
+      state.creditOnUserInfo = null
+      state.creditOnUserInfoPaid = false
+      state.chatRefusal = null
+      state.proxyStatus = 0
       state.sendCodeCalls = []
       state.loginCalls = []
       state.refreshCalls = []
       state.agentRefreshCalls = []
       state.taskCalls = []
+      state.taskListCalls = 0
+      state.userInfoCalls = []
+      state.ledgerCalls = 0
       state.walletCalls = 0
       state.chatCalls = []
       state.catalogCalls = 0
       state.lastUserapiHeaders = null
+      state.lastUserInfoHeaders = null
       state.lastProxyHeaders = null
       state.lastAuthHeader = null
     },
@@ -86,6 +127,7 @@ export function fakeAutoClaw() {
       const AUTHED = new Set([
         "/agent-assetmgr/api/v2/wallets",
         "/agent-assetmgr/api/v1/points/expiring",
+        "/agent-assetmgr/api/v1/ledgers_std",
         "/agentpay/v1/assistant/subscribe-info",
         "/autoclaw-proxy/proxy/autoclaw-task-complete",
         "/autoclaw-proxy/proxy/autoclaw-task-list",
@@ -131,20 +173,60 @@ export function fakeAutoClaw() {
           return json(200, { code: 0, msg: "ok", data: { access_token: state.access, refresh_token: state.refresh } })
         }
 
+        if (path === "/userapi/v1/user-info") {
+          state.lastUserInfoHeaders = Object.fromEntries(req.headers)
+          state.userInfoCalls.push(body)
+          const h = req.headers
+          // the server only records the login event under the official desktop
+          // fingerprint (UA / 2.2.0 / win-x64 / AutoClaw20)
+          const official =
+            h.get("user-agent") === "AutoClaw/2.2.0 (win-x64)" &&
+            h.get("x-version") === "2.2.0" &&
+            h.get("x-tm") === "win-x64" &&
+            h.get("x-channel") === "AutoClaw20" &&
+            h.get("x-product") === "autoclaw" &&
+            h.get("x-lang") === "zh-CN" &&
+            h.get("authorization") === `Bearer ${state.access}`
+          if (!official) return json(403, { code: 400_002, msg: "客户端指纹不匹配" })
+          if (body.source_id !== "autoclaw" || !body.device_id) return json(200, { code: 400_001, msg: "参数错误" })
+          if (state.userInfoCode) return json(200, { code: state.userInfoCode, msg: "登录事件记录失败" })
+          // the login hook pays the activity (idempotent: one credit per day)
+          if (state.creditOnUserInfo && !state.creditOnUserInfoPaid) {
+            state.creditOnUserInfoPaid = true
+            state.campaignEntries.push({
+              wallet_id: "w-login",
+              wallet_scope: "campaign",
+              mutation_type: "credit",
+              amount: state.creditOnUserInfo.amount ?? 10000,
+              occurred_at: beijingIso(),
+              metadata: {
+                event_type: state.creditOnUserInfo.event_type ?? "autoclaw_user_active",
+                activity_id: state.creditOnUserInfo.activity_id ?? "autoclaw_user_active_reward_202611",
+                description: state.creditOnUserInfo.description ?? "每周限时激励",
+              },
+            })
+          }
+          return json(200, { code: 0, msg: "ok", data: { daily_check_in_completed_on_request: false } })
+        }
+
         if (path === "/agent-assetmgr/api/v2/wallets") {
           state.walletCalls++
+          const wallets = state.walletRows ?? [
+            { public_wallet_type: "daily", display_name: "赠送积分", balance: 200, display: true, priority: 1 },
+            { public_wallet_type: "long_term", display_name: "通用积分", balance: 12500, display: true, priority: 3 },
+            { public_wallet_type: "hidden", display_name: "隐藏", balance: 999, display: false, priority: 2 },
+          ]
           return json(200, {
             code: 0,
             msg: "ok",
-            data: {
-              total_balance: 12700,
-              wallets: [
-                { public_wallet_type: "daily", display_name: "赠送积分", balance: 200, display: true, priority: 1 },
-                { public_wallet_type: "long_term", display_name: "通用积分", balance: 12500, display: true, priority: 3 },
-                { public_wallet_type: "hidden", display_name: "隐藏", balance: 999, display: false, priority: 2 },
-              ],
-            },
+            data: { total_balance: state.walletTotal, wallets },
           })
+        }
+
+        if (path === "/agent-assetmgr/api/v1/ledgers_std") {
+          state.ledgerCalls++
+          if (state.ledgerStatus) return json(state.ledgerStatus, { code: 500_000, msg: "内部错误" })
+          return json(200, { code: 0, msg: "ok", data: { entries: state.campaignEntries } })
         }
 
         if (path === "/agent-assetmgr/api/v1/points/expiring") {
@@ -171,12 +253,17 @@ export function fakeAutoClaw() {
         }
 
         if (path === "/autoclaw-proxy/proxy/autoclaw-task-list") {
+          state.taskListCalls++
+          if (state.taskListMode === "error") return json(500, { code: 500_000, msg: "内部错误" })
+          if (state.taskListMode === "quota") return json(403, { code: 810_000, message: "GLM-5.3 免费额度已用完，请升级会员" })
+          if (state.taskListMode === "banned") return json(403, { code: 410_004, message: "The account has been banned" })
+          if (state.taskListMode === "empty") return json(200, { code: 0, msg: "ok", data: [] })
           return json(200, {
             code: 0,
             msg: "ok",
             data: [
-              { task_id: "daily_signin", completed: state.signinDone },
-              { task_id: "daily_inspiration_center", completed: state.inspirationDone, client_triggered: true },
+              { task_id: "daily_signin", status: state.signinDone ? "completed" : "active", reward_points: 200 },
+              { task_id: "daily_inspiration_center", status: state.inspirationDone ? "completed" : "active", reward_points: 200, client_triggered: true },
             ],
           })
         }
@@ -202,6 +289,11 @@ export function fakeAutoClaw() {
         state.lastProxyHeaders = Object.fromEntries(req.headers)
         const auth = req.headers.get("x-authorization") ?? ""
         if (auth !== `Bearer ${state.access}`) return json(401, { message: "unauthorized" })
+        if (state.proxyStatus) return json(state.proxyStatus, { message: "unauthorized" })
+        // a 403 that is the account's own state (spent quota / ban)
+        if (state.chatRefusal === "quota")
+          return json(403, { code: 810_000, message: "GLM-5.3 免费额度已用完，请升级会员后继续使用" })
+        if (state.chatRefusal === "banned") return json(403, { code: 410_004, message: "The account has been banned" })
         // the proxy pre-refuses a small max_tokens (406, empty body)
         const body = await req.json().catch(() => ({}))
         if (typeof body.max_tokens === "number" && body.max_tokens > 0 && body.max_tokens < 10_000)

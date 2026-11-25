@@ -14,6 +14,7 @@ let fake
 let plugin
 let saved = {}
 let tmpDir
+let usageSeq = 0
 const client = { auth: { set: async ({ body }) => (saved = body) } }
 const getAuth = async () => saved
 
@@ -41,17 +42,24 @@ beforeAll(async () => {
   process.env.AUTOCLAW_USERAPI_BASE_URL = fake.base
   process.env.AUTOCLAW_UPSTREAM_BASE_URL = fake.proxyBase
   process.env.AGENT2API_DB = dbPath
+  // the user-info fallback host: a closed loopback port, so a failed login
+  // event never reaches the real vendor in a test
+  process.env.AUTOCLAW_USERINFO_ALT_BASE_URL = "http://127.0.0.1:1"
 })
 
 afterAll(() => {
   fake.server.stop(true)
   rmSync(tmpDir, { recursive: true, force: true })
+  delete process.env.AUTOCLAW_USERINFO_ALT_BASE_URL
 })
 
 beforeEach(async () => {
   fake.state.reset()
   saved = { type: "oauth", access: fake.state.access, refresh: fake.state.refresh, deviceId: fake.state.deviceId, expires: Date.now() + 3600e3, accountId: "138****8000", name: "138****8000", source: "agent2api" }
   plugin = await AutoClawAuthPlugin({ client })
+  // never touch the real ~/.config/magpie: every test gets its own state file
+  _internal.setUsageStatePath(join(tmpDir, `usage-${++usageSeq}.json`))
+  _internal.campaignCache.clear()
 })
 
 describe("sign-in methods", () => {
@@ -208,6 +216,33 @@ describe("chat", () => {
     const res = await loader.fetch(`${fake.proxyBase}/embeddings`, { method: "POST", body: "{}" })
     expect(res.status).toBe(404)
   })
+
+  test("a 403 quota refusal becomes a 429 with the sign-in kept", async () => {
+    fake.state.chatRefusal = "quota"
+    const res = await call({ model: "glm-5.3", stream: false, messages: [] })
+    expect(res.status).toBe(429)
+    expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
+    const body = await res.json()
+    expect(body.error.message).toContain("额度已用完")
+    expect(body.error.type).toBe("rate_limit_error")
+  })
+
+  test("a 403 banned account stays a 403 with the sign-in kept", async () => {
+    fake.state.chatRefusal = "banned"
+    const res = await call({ model: "glm-5.3", stream: false, messages: [] })
+    expect(res.status).toBe(403)
+    expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
+    const body = await res.json()
+    expect(body.error.message).toContain("banned")
+    expect(body.error.type).toBe("permission_error")
+  })
+
+  test("a plain 401 is still an expired sign-in", async () => {
+    fake.state.proxyStatus = 401
+    const res = await call({ model: "glm-5.3", stream: false, messages: [] })
+    expect(res.status).toBe(401)
+    expect(res.headers.get("x-magpie-sign-in")).toBe("expired")
+  })
 })
 
 describe("renewal", () => {
@@ -235,13 +270,31 @@ describe("checkin", () => {
   // the two daily tasks, in press order
   const pressed = () => fake.state.taskCalls.map((c) => c.task_id)
 
-  test("the first press claims both daily tasks", async () => {
+  test("user-info runs first, then both daily tasks, and the message has no miss note", async () => {
     const result = await plugin.auth.checkin(getAuth)
     expect(result.outcome).toBe("claimed")
     expect(result.credit).toBe(400)
-    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
     expect(result.message).toContain("签到成功，获得 200 积分")
     expect(result.message).toContain("灵感中心已领取 200 积分")
+    expect(result.message).not.toContain("活动奖励未触发")
+
+    // the official desktop fingerprint reached the fake
+    expect(fake.state.userInfoCalls.length).toBe(1)
+    expect(fake.state.userInfoCalls[0]).toMatchObject({ source_id: "autoclaw", device_id: fake.state.deviceId })
+    const h = fake.state.lastUserInfoHeaders
+    expect(h["user-agent"]).toBe("AutoClaw/2.2.0 (win-x64)")
+    expect(h["x-version"]).toBe("2.2.0")
+    expect(h["x-tm"]).toBe("win-x64")
+    expect(h["x-channel"]).toBe("AutoClaw20")
+    expect(h["x-product"]).toBe("autoclaw")
+    expect(h["x-lang"]).toBe("zh-CN")
+    expect(h["authorization"]).toBe(`Bearer ${fake.state.access}`)
+    expect(h["x-auth-sign"]).toBe(
+      createHash("md5").update(`100003&${h["x-auth-timestamp"]}&38d2391985e2369a5fb8227d8e6cd5e5`).digest("hex"),
+    )
+
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+    expect(fake.state.taskListCalls).toBe(1)
   })
 
   test("a second press the same day is 'done' for both", async () => {
@@ -251,6 +304,57 @@ describe("checkin", () => {
     expect(again.credit).toBe(0)
     expect(again.message).toContain("已签到")
     expect(again.message).toContain("灵感中心")
+    // the task list reports both completed: neither task is pressed again
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+  })
+
+  test("user-info failure is reported but never blocks the check-in", async () => {
+    fake.state.userInfoCode = 500_001
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    expect(result.message).toContain("签到成功，获得 200 积分")
+    expect(result.message.endsWith("活动奖励未触发（登录未上报）")).toBe(true)
+  })
+
+  test("a completed daily_signin in the task list is skipped, the inspiration center is still pressed", async () => {
+    fake.state.signinDone = true
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(200)
+    expect(pressed()).toEqual(["daily_inspiration_center"])
+    expect(result.message).toContain("今天已签到")
+    expect(result.message).toContain("灵感中心已领取 200 积分")
+  })
+
+  test("an empty task list is 'inactive' with nothing pressed", async () => {
+    fake.state.taskListMode = "empty"
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("inactive")
+    expect(result.message).toBe("当前没有签到活动")
+    expect(pressed()).toEqual([])
+  })
+
+  test("an unanswered task list falls back to pressing both tasks", async () => {
+    fake.state.taskListMode = "error"
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+  })
+
+  test("a 403 quota on the task list throws {quota, signIn:kept} without renewing", async () => {
+    fake.state.taskListMode = "quota"
+    await expect(plugin.auth.checkin(getAuth)).rejects.toMatchObject({ quota: true, signIn: "kept" })
+    expect(fake.state.refreshCalls.length).toBe(0)
+    expect(pressed()).toEqual([])
+  })
+
+  test("a 403 ban on the task list throws {banned, signIn:kept} without renewing", async () => {
+    fake.state.taskListMode = "banned"
+    await expect(plugin.auth.checkin(getAuth)).rejects.toMatchObject({ banned: true, signIn: "kept" })
+    expect(fake.state.refreshCalls.length).toBe(0)
+    expect(pressed()).toEqual([])
   })
 
   test("a failing inspiration task does not block the sign-in credit", async () => {
@@ -298,17 +402,172 @@ describe("checkin", () => {
   })
 })
 
+describe("checkin activity reward", () => {
+  const pressed = () => fake.state.taskCalls.map((c) => c.task_id)
+  // the vendor's ledger timestamp shape (+08:00), so the Beijing day is clear
+  const beijingIso = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().replace(/\.\d+Z$/, "+08:00")
+  const activityEntry = (over = {}, md = {}) => ({
+    wallet_id: "w-login",
+    wallet_scope: "campaign",
+    mutation_type: "credit",
+    amount: 10000,
+    occurred_at: beijingIso(),
+    metadata: {
+      event_type: "autoclaw_user_active",
+      activity_id: "autoclaw_user_active_reward_202611",
+      description: "每周限时激励",
+      ...md,
+    },
+    ...over,
+  })
+
+  test("a payout already in today's ledger skips user-info and is reported", async () => {
+    fake.state.campaignEntries = [activityEntry()]
+    const result = await plugin.auth.checkin(getAuth)
+    // the login event is not fired: the desktop client already paid it
+    expect(fake.state.userInfoCalls.length).toBe(0)
+    expect(fake.state.lastUserInfoHeaders).toBeNull()
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400) // the activity payout never counts as credit
+    expect(result.message).toContain("活动奖励已到账 +10,000（每周限时激励）")
+    expect(result.message).not.toContain("活动奖励未触发")
+    // both tasks still run
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+  })
+
+  test("no payout yet: user-info pays it, the read-back reports it and the cache drops", async () => {
+    fake.state.creditOnUserInfo = { amount: 10000, description: "每周限时激励" }
+    // prime the display cache with the (still empty) ledger
+    await plugin.auth.usage(getAuth)
+    expect(fake.state.ledgerCalls).toBe(1)
+    const result = await plugin.auth.checkin(getAuth)
+    expect(fake.state.userInfoCalls.length).toBe(1)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    expect(result.message).toContain("活动奖励已到账 +10,000（每周限时激励）")
+    // live read before the trigger + one read-back after it
+    expect(fake.state.ledgerCalls).toBe(3)
+    // the login event may have just paid: the display cache is dropped
+    await plugin.auth.usage(getAuth)
+    expect(fake.state.ledgerCalls).toBe(4)
+  })
+
+  test("no payout and a failed login event: the miss note is appended, tasks unaffected", async () => {
+    fake.state.userInfoCode = 500_001
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    expect(result.message).toContain("签到成功，获得 200 积分")
+    expect(result.message.endsWith("活动奖励未触发（登录未上报）")).toBe(true)
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+    // no read-back after a failed trigger
+    expect(fake.state.ledgerCalls).toBe(1)
+  })
+
+  test("a failed ledger read leaves the message clean and the check-in intact", async () => {
+    fake.state.ledgerStatus = 500
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    // the login event is still attempted, the tasks still run
+    expect(fake.state.userInfoCalls.length).toBe(1)
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+    // unknown is not 「未触发」: the activity segment is absent entirely
+    expect(result.message).not.toContain("活动奖励")
+  })
+
+  test("two activities pay out: labels collapse to a count and the amounts sum", async () => {
+    fake.state.campaignEntries = [
+      activityEntry({ wallet_id: "w-a", amount: 10000 }, { description: "每周限时激励" }),
+      activityEntry({ wallet_id: "w-b", amount: 500 }, { description: "新手 Day 1/7" }),
+    ]
+    const result = await plugin.auth.checkin(getAuth)
+    expect(fake.state.userInfoCalls.length).toBe(0)
+    expect(result.message).toContain("活动奖励已到账 +10,500（2 个活动）")
+    expect(result.credit).toBe(400)
+  })
+})
+
+describe("todayActivityReward", () => {
+  const now = Date.parse("2026-11-25T04:00:00Z") // Beijing 2026-11-25 12:00
+  const row = (over = {}, md = {}) => ({
+    wallet_scope: "campaign",
+    mutation_type: "credit",
+    amount: 500,
+    occurred_at: "2026-11-25T11:52:16.804+08:00",
+    metadata: { event_type: "autoclaw_user_active", description: "每周限时激励", ...md },
+    ...over,
+  })
+
+  test("only today's matching campaign credits are counted", () => {
+    const entries = [
+      row(),
+      // the same activity, but yesterday's Beijing day
+      row({ occurred_at: "2026-11-24T23:59:59+08:00" }),
+      // another family: the check-in task itself is not a login payout
+      row({}, { event_type: "autoclaw_checkin_daily" }),
+      // not a credit
+      row({ mutation_type: "debit" }),
+      // not the campaign wallet (the server may ignore the filter)
+      row({ wallet_scope: "daily" }),
+      // no readable timestamp: conservatively skipped
+      row({ occurred_at: null }),
+    ]
+    expect(_internal.todayActivityReward(entries, now)).toEqual({ amount: 500, labels: ["每周限时激励"], count: 1 })
+    expect(_internal.todayActivityReward([], now)).toBeNull()
+    expect(_internal.todayActivityReward(null, now)).toBeNull()
+  })
+
+  test("activity_id is the fallback without event_type, and the signup-day family counts", () => {
+    const entries = [
+      row(
+        { amount: 20000 },
+        { event_type: undefined, activity_id: "autoclaw_user_active_bonus_20261125", description: "一次性大礼包" },
+      ),
+      row(
+        { amount: 10000 },
+        { event_type: "autoclaw_user_signup_day_2", activity_id: "autoclaw_new_user_day_1_to_7_bonus", description: "新手 Day 2/7" },
+      ),
+      // no event_type and an unknown activity_id: not a payout
+      row({ amount: 5000 }, { event_type: undefined, activity_id: "autoclaw_checkin_daily_202611" }),
+    ]
+    const reward = _internal.todayActivityReward(entries, now)
+    expect(reward.amount).toBe(30000)
+    expect(reward.count).toBe(2)
+    expect(reward.labels.length).toBe(2)
+  })
+
+  test("a payout with no description still counts, without a label", () => {
+    expect(_internal.todayActivityReward([row({}, { description: "" })], now)).toEqual({ amount: 500, labels: [], count: 1 })
+  })
+
+  test("labels are de-duplicated, truncated to 40 chars and stripped of the credit suffix", () => {
+    const description = `${"超长活动名".repeat(12)} +12,345 credits`
+    const reward = _internal.todayActivityReward([row({}, { description }), row({}, { description })], now)
+    expect(reward.labels.length).toBe(1)
+    expect(reward.labels[0].length).toBe(40)
+    expect(reward.labels[0]).not.toContain("credits")
+  })
+})
+
 describe("usage", () => {
   const webWindow = (usage) => usage.windows.find((w) => w.name === "网页版快捷登录")
+  const balanceWindow = (usage) => usage.windows.find((w) => w.name === "积分余额")
+  const campaignWindow = (usage) => usage.windows.find((w) => w.name === "活动积分")
 
-  test("the point wallets, hidden ones dropped, the web entry last", async () => {
+  test("windows are ordered check-in → balance → campaign → web, with a wallet breakdown", async () => {
     const usage = await plugin.auth.usage(getAuth)
     expect(usage.signIn).toBe("kept")
-    expect(usage.windows.map((w) => w.name)).toEqual(["赠送积分", "通用积分", "网页版快捷登录"])
-    expect(usage.windows[0].display).toBe("200 积分")
-    expect(usage.windows[1].display).toBe("12500 积分")
-    // the hidden wallet (display:false) is still dropped
-    expect(usage.windows.map((w) => w.display)).not.toContain("999 积分")
+    expect(usage.windows.map((w) => w.name)).toEqual(["每日签到", "积分余额", "网页版快捷登录"])
+    expect(usage.windows[0].display).toBe("今日未签（+200）")
+    const balance = balanceWindow(usage)
+    expect(balance.balance).toBe(12700)
+    expect(balance.unit).toBe("积分")
+    // a pure balance reads `balance`, never `used`
+    expect(balance.used).toBeUndefined()
+    expect(usage.balance).toBe("12,700 积分（赠送积分 200 · 通用积分 12,500）")
+    // the hidden wallet (display:false) contributes nothing
+    expect(usage.balance).not.toContain("999")
     expect(fake.state.walletCalls).toBe(1)
   })
 
@@ -340,6 +599,102 @@ describe("usage", () => {
     } finally {
       delete process.env.AUTOCLAW_WEB_BASE_URL
     }
+  })
+
+  test("the campaign ledger reconciles per wallet instance and filters non-campaign rows", async () => {
+    const now = Math.floor(Date.now() / 1000)
+    fake.state.campaignEntries = [
+      { wallet_id: "w1", wallet_scope: "campaign", mutation_type: "credit", amount: 5000, wallet_expires_at: now + 3 * 86400, metadata: { description: "AutoClaw 用户登录奖励 +5000 credits" } },
+      { wallet_id: "w1", wallet_scope: "campaign", mutation_type: "debit", amount: 1000, wallet_expires_at: now + 3 * 86400 },
+      // an instance whose credit row fell out of the window: 0 left, expiry still counts
+      { wallet_id: "w2", wallet_scope: "campaign", mutation_type: "expire", amount: 7711, wallet_expires_at: now - 86400 },
+      // the server ignores the scope filter: a non-campaign row must be dropped
+      { wallet_id: "w3", wallet_scope: "daily", mutation_type: "credit", amount: 9999, metadata: { description: "非活动" } },
+    ]
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.windows.map((w) => w.name)).toEqual(["每日签到", "积分余额", "活动积分", "网页版快捷登录"])
+    const campaign = campaignWindow(usage)
+    expect(campaign.display).toBe("剩 4,000（AutoClaw 用户登录奖励） · 已领 5,000 · 过期 7,711（近期）")
+    // never a second balance-bearing window
+    expect(campaign.balance).toBeUndefined()
+    expect(Object.keys(campaign).sort()).toEqual(["aside", "display", "name", "used"])
+    // the soonest lapse is marked on the balance window, capped at the total
+    const balance = balanceWindow(usage)
+    expect(balance.runsOutAt).toBe(new Date((now + 3 * 86400) * 1000).toISOString())
+    expect(balance.runsOut).toBe(4000)
+    expect(fake.state.ledgerCalls).toBe(1)
+  })
+
+  test("an empty ledger adds no activity row", async () => {
+    fake.state.campaignEntries = []
+    const usage = await plugin.auth.usage(getAuth)
+    expect(campaignWindow(usage)).toBeUndefined()
+    expect(balanceWindow(usage).balance).toBe(12700)
+  })
+
+  test("a failing ledger omits the row without caching the failure", async () => {
+    fake.state.ledgerStatus = 500
+    const first = await plugin.auth.usage(getAuth)
+    expect(campaignWindow(first)).toBeUndefined()
+    expect(balanceWindow(first).balance).toBe(12700)
+    expect(fake.state.ledgerCalls).toBe(1)
+    // not cached: the next usage retries at once
+    await plugin.auth.usage(getAuth)
+    expect(fake.state.ledgerCalls).toBe(2)
+    // once it answers, the row appears
+    fake.state.ledgerStatus = 0
+    const now = Math.floor(Date.now() / 1000)
+    fake.state.campaignEntries = [
+      { wallet_id: "w1", wallet_scope: "campaign", mutation_type: "credit", amount: 5000, wallet_expires_at: now + 86400, metadata: { description: "AutoClaw 用户登录奖励" } },
+    ]
+    const third = await plugin.auth.usage(getAuth)
+    expect(campaignWindow(third).display).toContain("剩 5,000")
+    expect(fake.state.ledgerCalls).toBe(3)
+  })
+
+  test("a successful ledger read is cached for 10 minutes and user-info clears it", async () => {
+    const now = Math.floor(Date.now() / 1000)
+    fake.state.campaignEntries = [
+      { wallet_id: "w1", wallet_scope: "campaign", mutation_type: "credit", amount: 5000, wallet_expires_at: now + 86400, metadata: { description: "AutoClaw 用户登录奖励" } },
+    ]
+    await plugin.auth.usage(getAuth)
+    await plugin.auth.usage(getAuth)
+    expect(fake.state.ledgerCalls).toBe(1)
+    // a successful login event may have just paid a reward: the cache goes
+    // (the check-in's own reads are live: pre-payout + read-back)
+    await plugin.auth.checkin(getAuth)
+    expect(fake.state.ledgerCalls).toBe(3)
+    await plugin.auth.usage(getAuth)
+    expect(fake.state.ledgerCalls).toBe(4)
+  })
+
+  test("an invalid total_balance is an error, never recorded as 0", async () => {
+    fake.state.walletTotal = null
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage).toEqual({ error: "积分响应异常", windows: [] })
+  })
+
+  test("this round's spend: nothing on the first read, a new round on a rise, spent on a fall", async () => {
+    const first = await plugin.auth.usage(getAuth)
+    expect(first.windows.map((w) => w.name)).not.toContain("本轮消耗")
+
+    fake.state.walletTotal = 13000
+    const risen = await plugin.auth.usage(getAuth)
+    // any rise starts a new round: peak = total, used = 0
+    expect(risen.windows.map((w) => w.name)).not.toContain("本轮消耗")
+
+    fake.state.walletTotal = 12000
+    const spent = await plugin.auth.usage(getAuth)
+    const row = spent.windows.find((w) => w.name === "本轮消耗")
+    expect(row).toBeTruthy()
+    expect(row.used).toBe(7.7) // 1000 / 13000
+    expect(row.amount).toBe(1000)
+    expect(row.limit).toBe(13000)
+    expect(row.aside).toBe(true)
+    expect(row.display).toBe("1,000 / 13,000 积分 · 今日 -1,000 · 今日 +300")
+    expect(Object.keys(row).sort()).toEqual(["amount", "aside", "display", "limit", "name", "used"])
+    // the balance window still carries the live total
+    expect(balanceWindow(spent).balance).toBe(12000)
   })
 
   test("a failing usage keeps {error, signIn} and adds no window", async () => {
@@ -448,5 +803,89 @@ describe("helpers", () => {
     const tok = fake.jwt(Math.floor(Date.now() / 1000) + 60, "20260001", "d")
     expect(_internal.jwtEnd(tok)).toBeGreaterThan(Date.now() + 50_000)
     expect(_internal.jwtEnd("not-a-jwt")).toBe(0)
+  })
+
+  test("fmtPoints groups thousands without a locale", () => {
+    expect(_internal.fmtPoints(0)).toBe("0")
+    expect(_internal.fmtPoints(200)).toBe("200")
+    expect(_internal.fmtPoints(4000)).toBe("4,000")
+    expect(_internal.fmtPoints(12700)).toBe("12,700")
+    expect(_internal.fmtPoints(1234567)).toBe("1,234,567")
+  })
+
+  test("campaign labels drop the trailing credit amount", () => {
+    expect(_internal.campaignLabel({}, { description: "AutoClaw 用户登录奖励 +5000 credits" })).toBe("AutoClaw 用户登录奖励")
+    expect(_internal.campaignLabel({}, { description: "AutoClaw Weekly Perks +4,000 积分" })).toBe("AutoClaw Weekly Perks")
+    expect(_internal.campaignLabel({ description: "纯活动名" }, {})).toBe("纯活动名")
+  })
+
+  test("campaign breakdown counts a window-out instance as 0 and its expiry as expired", () => {
+    const now = 1_000_000
+    const camp = _internal.campaignBreakdown(
+      [
+        { wallet_id: "a", wallet_scope: "campaign", mutation_type: "credit", amount: 5000, wallet_expires_at: now / 1000 + 100, metadata: { description: "活动 A +5000 credits" } },
+        { wallet_id: "a", wallet_scope: "campaign", mutation_type: "debit", amount: 1000 },
+        { wallet_id: "b", wallet_scope: "campaign", mutation_type: "expire", amount: 700 },
+        { wallet_id: "c", wallet_scope: "monthly", mutation_type: "credit", amount: 9000 },
+        { wallet_id: "d", wallet_scope: "campaign", mutation_type: "hold", amount: 50 },
+      ],
+      now,
+    )
+    expect(camp).toEqual({ claimed: 5000, expired: 700, remaining: 4000, labels: ["活动 A"], lapseAt: (now / 1000 + 100) * 1000, lapsing: 4000 })
+    expect(_internal.campaignBreakdown([])).toBeNull()
+  })
+
+  test("the device id prefers the stored one, then the access/refresh JWT claims", () => {
+    const exp = Math.floor(Date.now() / 1000) + 3600
+    const access = fake.jwt(exp, "u", "dev-access")
+    const refresh = fake.jwt(exp, "u", "dev-refresh")
+    expect(_internal.accountDeviceId({ deviceId: "stored" }, access, refresh)).toBe("stored")
+    expect(_internal.accountDeviceId({}, access, refresh)).toBe("dev-access")
+    expect(_internal.accountDeviceId({}, "", refresh)).toBe("dev-refresh")
+    expect(_internal.accountDeviceId({}, "", "")).toBe("")
+  })
+
+  test("the Beijing day boundary rolls over at 16:00Z", () => {
+    expect(_internal.beijingDayOf(new Date("2026-01-01T15:59:00Z"))).toBe("2026-01-01")
+    expect(_internal.beijingDayOf(new Date("2026-01-01T16:30:00Z"))).toBe("2026-01-02")
+  })
+
+  test("the state key prefers the uid, else the token hash", () => {
+    expect(_internal.accountKey("autoclaw", { uid: "20260001" })).toBe("autoclaw|uid:20260001")
+    expect(_internal.accountKey("autoclaw", { userId: "20260001" })).toBe("autoclaw|uid:20260001")
+    const key = _internal.accountKey("autoclaw", { refresh: "refresh-1" })
+    expect(key).toMatch(/^autoclaw\|tok:[0-9a-f]{16}$/)
+    expect(key).toBe(_internal.accountKey("autoclaw", { access: "refresh-1" }))
+  })
+
+  test("the default state path lives under XDG or the home config dir", () => {
+    const prevXdg = process.env.XDG_CONFIG_HOME
+    const prevFile = process.env.AUTOCLAW_USAGE_STATE_FILE
+    const prevHome = process.env.HOME
+    const prevProfile = process.env.USERPROFILE
+    delete process.env.AUTOCLAW_USAGE_STATE_FILE
+    process.env.XDG_CONFIG_HOME = "C:/tmp/xdg"
+    try {
+      expect(_internal.usageStatePathDefault()).toBe("C:/tmp/xdg/magpie/autoclaw-usage.json")
+      delete process.env.XDG_CONFIG_HOME
+      process.env.HOME = ""
+      process.env.USERPROFILE = "C:/Users/example"
+      expect(_internal.usageStatePathDefault()).toBe("C:/Users/example/.config/magpie/autoclaw-usage.json")
+    } finally {
+      if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME
+      else process.env.XDG_CONFIG_HOME = prevXdg
+      if (prevFile === undefined) delete process.env.AUTOCLAW_USAGE_STATE_FILE
+      else process.env.AUTOCLAW_USAGE_STATE_FILE = prevFile
+      if (prevHome === undefined) delete process.env.HOME
+      else process.env.HOME = prevHome
+      if (prevProfile === undefined) delete process.env.USERPROFILE
+      else process.env.USERPROFILE = prevProfile
+    }
+  })
+
+  test("setUsageStatePath keeps reads and writes inside the temp dir", async () => {
+    _internal.setUsageStatePath(join(tmpDir, "isolated.json"))
+    _internal.balanceObserve(`autoclaw|uid:isolated-${usageSeq}`, 1000)
+    expect(_internal.usageStatePath()).toBe(join(tmpDir, "isolated.json"))
   })
 })

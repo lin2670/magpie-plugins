@@ -9,6 +9,18 @@
 // from aimod-cc/agent2api (MIT), providers/autoclaw, rewritten for magpie's
 // plugin API.
 //
+// Since 0.3.0 it also mirrors the community plugin's activity-points work:
+// a check-in reports the desktop client's login event (`/userapi/v1/user-info`
+// with the official fingerprint headers, which is what makes the vendor pay
+// the login campaign reward), the usage card reconciles the campaign ledger
+// into an「活动积分」row, and a 403 that is a spent quota or a banned account
+// no longer reads as an expired sign-in.
+//
+// Since 0.4.0 the check-in confirms that reward instead of firing blindly:
+// today's campaign ledger is read first (a payout already there means the
+// login event is skipped), the trigger is followed by a read-back, and what
+// landed is appended to the check-in message as「活动奖励已到账 +N（…）」.
+//
 // Two things about this vendor are load-bearing and easy to get wrong:
 //   1. the account domain (login / refresh / points / check-in / model
 //      catalog) signs every request with a client fingerprint
@@ -22,6 +34,9 @@
 //      normalizer below).
 
 import { createHash, randomBytes, randomUUID } from "node:crypto"
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { dirname } from "node:path"
 
 // agent2apiAccounts reads the accounts agent2api (aimod-cc) keeps on this
 // machine, to import a sign-in from it: nothing is written there. Returns
@@ -115,6 +130,27 @@ const LLM_TIMEOUT = 900_000
 const DAILY_SIGNIN_TASK_ID = "daily_signin"
 const INSPIRATION_TASK_ID = "daily_inspiration_center"
 const TASK_COMPLETE_PATH = "/autoclaw-proxy/proxy/autoclaw-task-complete"
+const TASK_LIST_PATH = "/autoclaw-proxy/proxy/autoclaw-task-list"
+
+// the points routes: v2 wallets (the primary read), its v1 fallback, and the
+// campaign ledger (activity points, display only)
+const WALLETS_PATH = "/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw"
+const LEGACY_WALLETS_PATH = "/agent-assetmgr/api/v1/wallet-instances?wallet_type=all&wallet_scope=all"
+const CAMPAIGN_LEDGER_PATH = "/agent-assetmgr/api/v1/ledgers_std?biz_app_id=autoclaw&page_size=200&wallet_scope=campaign"
+
+// the login event: the vendor only records `autoclaw_user_active` (and pays the
+// 「用户登录奖励」campaign) when this request carries the official desktop
+// client's fingerprint. Measured 2026-11-06 over five accounts: the plugin's
+// own account headers answer code 0 but pay nothing, the AutoClaw20/2.2.0 set
+// pays the reward on every account.
+const USER_INFO_PATH = "/userapi/v1/user-info"
+const DESKTOP_UA = "AutoClaw/2.2.0 (win-x64)"
+const DESKTOP_VERSION = "2.2.0"
+const DESKTOP_TM = "win-x64"
+const DESKTOP_CHANNEL = "AutoClaw20"
+// the domestic account domain, tried after the configured userapi base fails
+const USER_INFO_ALT_HOST = "https://autoglm-api.zhipuai.cn"
+const userInfoAltBase = () => env("AUTOCLAW_USERINFO_ALT_BASE_URL", USER_INFO_ALT_HOST)
 
 // ── small helpers ──────────────────────────────────────────────────────────
 
@@ -123,6 +159,30 @@ const stripBearer = (token) => String(token ?? "").replace(/^Bearer\s+/i, "").tr
 const toNum = (v) => {
   const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN
   return Number.isFinite(n) ? n : null
+}
+
+// a JWT claim (used for device_id and exp)
+function jwtClaim(token, key) {
+  const part = stripBearer(token).split(".")[1]
+  if (!part) return undefined
+  try {
+    const json = Buffer.from(part.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")
+    return JSON.parse(json)[key]
+  } catch {
+    return undefined
+  }
+}
+
+// the account's own device id: the one the login sent (and the server wrote
+// into the token's device_id claim), never a fixed string
+function accountDeviceId(auth, ...tokens) {
+  const given = String(auth?.deviceId ?? "").trim()
+  if (given) return given
+  for (const token of tokens) {
+    const claim = String(jwtClaim(token, "device_id") ?? "").trim()
+    if (claim) return claim
+  }
+  return ""
 }
 
 // a JWT's end in ms (0 when it carries none)
@@ -221,6 +281,121 @@ const codeOf = (payload) => {
   if (typeof n === "number") return n
   if (typeof n === "string" && n.trim() !== "" && Number.isFinite(Number(n))) return Number(n)
   return null
+}
+
+// ── a 403 that is not the sign-in ──────────────────────────────────────────
+//
+// The gateway answers a spent quota with 403 {"code":810000,…} and a banned
+// account with 403 {"code":410004,…}. Neither means the token is gone: signing
+// in again returns the same account and the same refusal, so magpie must keep
+// the sign-in and show the vendor's own words instead of dropping it.
+const QUOTA_CODES = new Set(["810000", "810001"])
+const QUOTA_WORDS = /额度|余额不足|余额已用完|用完|用尽|系统繁忙|升级会员|quota|insufficient[_ ]?(balance|credit)|exhausted/i
+const BANNED_CODES = new Set(["410004"])
+const BANNED_WORDS =
+  /\bbanned\b|封禁|封号|账号异常|账户异常|account (has been |is |was )?(suspended|frozen|disabled|blocked|restricted)|账[号户](已|已被|被)?(冻结|停用|禁用)/i
+
+// the code and message of a refusal body (only those fields, never the whole body)
+function refusalFields(text) {
+  let parsed = null
+  try {
+    parsed = JSON.parse(text)
+  } catch {}
+  return {
+    code: parsed?.code ?? parsed?.error?.code ?? null,
+    message: String(parsed?.message ?? parsed?.msg ?? parsed?.error?.message ?? "").trim(),
+  }
+}
+
+// a 403 read as the account's own state (quota / ban), or null when it is not
+function readRefusal(status, text) {
+  if (status !== 403) return null
+  const { code, message } = refusalFields(text)
+  if (BANNED_CODES.has(String(code)) || (message && BANNED_WORDS.test(message)))
+    return { kind: "banned", code, message: message || `account refused (code ${code})` }
+  if (QUOTA_CODES.has(String(code)) || (message && QUOTA_WORDS.test(message))) return { kind: "quota", code, message }
+  return null
+}
+
+// an error response that also carries magpie's sign-in verdict
+const refusalResponse = (status, message, signIn, type) =>
+  new Response(JSON.stringify({ error: { message, ...(type ? { type } : {}) } }), {
+    status,
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": signIn },
+  })
+
+// ── the login event (activity reward) ──────────────────────────────────────
+//
+// POST /userapi/v1/user-info with the official desktop fingerprint. The reply's
+// `daily_check_in_completed_on_request` is always false on the live service, so
+// it is not read: the daily check-in is still the task-complete call below.
+// Returns null on a transport failure; otherwise { ok, code, msg } so a 401
+// carrying code 0 never counts as reached.
+async function callUserInfo(access, deviceId, base) {
+  const timestamp = String(Math.max(0, Math.floor(Date.now() / 1000)))
+  const sign = createHash("md5").update(`${AUTH_APP_ID}&${timestamp}&${AUTH_APP_KEY}`).digest("hex")
+  let res
+  try {
+    res = await fetch(`${base}${USER_INFO_PATH}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "*/*",
+        "User-Agent": DESKTOP_UA,
+        "X-Version": DESKTOP_VERSION,
+        "X-Tm": DESKTOP_TM,
+        "X-Product": "autoclaw",
+        "X-Auth-Appid": AUTH_APP_ID,
+        "X-Auth-TimeStamp": timestamp,
+        "X-Auth-Sign": sign,
+        "X-Trace-Id": randomBytes(8).toString("hex"),
+        "X-Lang": CLIENT_LANG,
+        "X-Channel": DESKTOP_CHANNEL,
+        Authorization: `Bearer ${stripBearer(access)}`,
+      },
+      body: JSON.stringify({ source_id: "autoclaw", device_id: deviceId }),
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch {
+    return null
+  }
+  const parsed = await res.json().catch(() => null)
+  return { ok: res.ok, code: codeOf(parsed), msg: parsed?.msg ?? parsed?.message }
+}
+
+// the hosts user-info is tried on: the configured account base first, then the
+// domestic account domain (the one the community implementation measured)
+const userInfoBases = () => [...new Set([userapiBase(), userInfoAltBase()])]
+
+// GET the task list. Resolves an array (possibly empty) when the host answered,
+// null when it answered something unusable (5xx / non-envelope). 401/403 throw:
+// quota and ban carry signIn "kept", anything else is the sign-in (expired).
+async function callTaskList(access) {
+  let res
+  try {
+    res = await fetch(`${userapiBase()}${TASK_LIST_PATH}`, {
+      headers: userapiHeaders(access),
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch (e) {
+    throw new Error(`AutoClaw task-list 请求失败：${e?.message ?? e}`)
+  }
+  if (res.status === 401 || res.status === 403) {
+    const text = await res.text().catch(() => "")
+    const refusal = readRefusal(res.status, text)
+    if (refusal)
+      throw Object.assign(new Error(`AutoClaw：${refusal.message || refusal.kind}`), {
+        ...(refusal.kind === "banned" ? { banned: true } : { quota: true }),
+        signIn: "kept",
+      })
+    throw expired(`登录已失效（HTTP ${res.status}）`)
+  }
+  if (!res.ok) return null
+  const payload = await res.json().catch(() => null)
+  const code = codeOf(payload)
+  if (code != null && AUTH_EXPIRED_CODES.has(code)) throw expired("AutoClaw 登录态已失效，无法签到（请重新登录）")
+  if (code != null && code !== 0) return null
+  return Array.isArray(payload?.data) ? payload.data : null
 }
 
 // ── token renewal ──────────────────────────────────────────────────────────
@@ -681,6 +856,301 @@ function normalizeLegacyWallets(payload) {
   return { total: toNum(data.total_balance), wallets }
 }
 
+// ── the campaign ledger (activity points) ──────────────────────────────────
+//
+// The server opens one wallet instance per activity; every credit / debit /
+// expire ledger row carries the instance's `wallet_id` and `wallet_scope`, so
+// "how much of the activity is left" is exact: credit − debit − expire per
+// instance. The window holds only the most recent ~151 rows (page_size tops out
+// at 200, paging is a no-op) and activities live at most 7 days, so a live
+// activity's whole lifecycle is inside it. The server may ignore the
+// `wallet_scope` filter: campaignBreakdown filters again. Everything here is
+// display-only and never throws into the balance rows.
+
+// deterministic thousands grouping (no toLocaleString: CI/locale independent)
+const fmtPoints = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ",")
+
+// "AutoClaw 用户登录奖励 +5000 credits" → "AutoClaw 用户登录奖励"
+function campaignLabel(entry, md) {
+  const raw = String(md?.description ?? entry?.description ?? "").trim()
+  return raw.replace(/\s*\+\s*[\d.,]+\s*(?:credits?|积分)?\s*$/i, "").trim()
+}
+
+// the ledger rows → { claimed, expired, remaining, labels, lapseAt, lapsing }
+// (facts within the window), or null when there is no activity history.
+function campaignBreakdown(entries, now = Date.now()) {
+  const instances = new Map() // wallet_id → { credit, debit, expire, label, expires }
+  let claimed = 0
+  let expired = 0
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (!entry || typeof entry !== "object") continue
+    const md = entry.metadata && typeof entry.metadata === "object" ? entry.metadata : {}
+    const scope = String(entry.wallet_scope ?? md.wallet_scope ?? "").trim().toLowerCase()
+    if (scope !== "campaign") continue // the server may ignore the filter
+    const type = String(entry.mutation_type ?? "").trim().toLowerCase()
+    if (type !== "credit" && type !== "debit" && type !== "expire") continue
+    const amount = Number(entry.amount)
+    if (!Number.isFinite(amount)) continue
+    const id = String(entry.wallet_id ?? "?")
+    let inst = instances.get(id)
+    if (!inst) {
+      inst = { credit: 0, debit: 0, expire: 0, label: "", expires: 0 }
+      instances.set(id, inst)
+    }
+    const expires = Number(entry.wallet_expires_at)
+    if (Number.isFinite(expires) && expires > 0) inst.expires = expires * 1000
+    if (type === "credit") {
+      inst.credit += amount
+      claimed += amount
+      const label = campaignLabel(entry, md)
+      if (label) inst.label = label
+    } else if (type === "debit") {
+      inst.debit += Math.abs(amount)
+    } else {
+      inst.expire += Math.abs(amount)
+      expired += Math.abs(amount)
+    }
+  }
+  if (instances.size === 0) return null
+  let remaining = 0
+  let lapseAt = 0
+  let lapsing = 0
+  const labels = []
+  for (const inst of instances.values()) {
+    const left = inst.credit - inst.debit - inst.expire
+    if (left > 0) {
+      remaining += left
+      if (inst.label) labels.push(inst.label)
+    }
+    // an instance whose credit row fell out of the window counts as 0 spent,
+    // yet its expire row still counts in 「过期」
+    if (!(left > 0 && inst.expires > now)) continue
+    if (!lapseAt || inst.expires < lapseAt) (lapseAt = inst.expires), (lapsing = left)
+    else if (inst.expires === lapseAt) lapsing += left
+  }
+  return { claimed, expired, remaining, labels: [...new Set(labels)], lapseAt, lapsing }
+}
+
+// one request, no paging. Resolves the entries array (possibly empty: really no
+// activity history) or null (protocol change: entries not an array). Throws on
+// a transport/HTTP/envelope failure so the cache treats it as "not cached".
+async function fetchCampaignLedger(access) {
+  let res
+  try {
+    res = await fetch(`${userapiBase()}${CAMPAIGN_LEDGER_PATH}`, {
+      headers: userapiHeaders(access),
+      signal: AbortSignal.timeout(8_000),
+    })
+  } catch (e) {
+    throw new Error(`AutoClaw 活动流水请求失败：${e?.message ?? e}`)
+  }
+  if (!res.ok) throw new Error(`AutoClaw 活动流水 HTTP ${res.status}`)
+  const payload = await res.json().catch(() => null)
+  const code = codeOf(payload)
+  if (!payload || code !== 0 || !payload.data) throw new Error(`AutoClaw 活动流水异常 code=${code ?? "null"}`)
+  return Array.isArray(payload.data.entries) ? payload.data.entries : null
+}
+
+// ── today's login-activity payout (the check-in's confirm step) ────────────
+//
+// The vendor pays 「登录即发」 activities (Weekly Perks, the new-user Day 1-7
+// bonus) from the login hook; there is no claim endpoint. So a check-in reads
+// the campaign ledger first: a payout already there today means the desktop
+// client opening already paid it and user-info is skipped; otherwise the
+// trigger runs and the ledger is read back to confirm what just landed.
+//
+// Same judgement as agent2api's promotion.rs: `metadata.event_type` prefixes
+// are the primary key (activity_id suffixes change every period, and one
+// period can pay two different prefixes), activity_id prefixes only cover rows
+// that carry no event_type.
+const ACTIVITY_EVENT_PREFIXES = ["autoclaw_user_active", "autoclaw_user_signup_day"]
+const ACTIVITY_ID_PREFIXES = ["autoclaw_user_active_reward", "autoclaw_user_active_bonus"]
+
+// the ledger rows that are today's activity payout → { amount, labels, count },
+// or null when nothing landed. Campaign credits only; `occurred_at` must fall
+// on the Beijing day of `now` (a missing / broken timestamp is skipped: an
+// unreadable date must never turn into a false 「已到账」).
+function todayActivityReward(entries, now = Date.now()) {
+  const today = beijingDayOf(new Date(now))
+  let amount = 0
+  let count = 0
+  const labels = []
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (!entry || typeof entry !== "object") continue
+    const md = entry.metadata && typeof entry.metadata === "object" ? entry.metadata : {}
+    const scope = String(entry.wallet_scope ?? md.wallet_scope ?? "").trim().toLowerCase()
+    if (scope !== "campaign") continue // the server may ignore the filter
+    if (String(entry.mutation_type ?? "").trim().toLowerCase() !== "credit") continue
+    const when = new Date(entry.occurred_at ?? md.occurred_at ?? NaN)
+    if (!Number.isFinite(when.getTime()) || beijingDayOf(when) !== today) continue
+    const event = String(md.event_type ?? "")
+    const activityId = String(entry.activity_id ?? md.activity_id ?? "")
+    const matched =
+      ACTIVITY_EVENT_PREFIXES.some((prefix) => event.startsWith(prefix)) ||
+      (!event && ACTIVITY_ID_PREFIXES.some((prefix) => activityId.startsWith(prefix)))
+    if (!matched) continue
+    const value = toNum(entry.amount)
+    if (value == null) continue
+    amount += value
+    count++
+    const label = campaignLabel(entry, md)
+    if (label) labels.push(label.slice(0, 40))
+  }
+  if (!count) return null
+  return { amount, labels: [...new Set(labels)], count }
+}
+
+// the check-in's live read: a check-in happens once a day, so the ledger must
+// be fresh (the display cache would answer with a pre-payout snapshot). A
+// failed read is null = unknown — never a failed check-in.
+async function readCampaignForCheckin(access) {
+  try {
+    return await fetchCampaignLedger(access)
+  } catch {
+    return null
+  }
+}
+
+// the cache: 10 minutes per account key; failures are not cached (the next
+// usage retries at once), null (protocol change) is; checkin clears it when
+// user-info reached the server (the reward may have just landed). An in-flight
+// read that finishes after an invalidation does not write itself back.
+const CAMPAIGN_TTL_MS = 10 * 60 * 1000
+const CAMPAIGN_CACHE_MAX = 100
+const campaignCache = new Map() // accountKey → { at, value, promise }
+
+function campaignCached(key, loader) {
+  const held = campaignCache.get(key)
+  if (held?.promise) return held.promise
+  if (held && Date.now() - held.at < CAMPAIGN_TTL_MS) return Promise.resolve(held.value)
+  while (campaignCache.size >= CAMPAIGN_CACHE_MAX) {
+    let evicted = false
+    for (const [k, gate] of campaignCache) {
+      if (!gate.promise) {
+        campaignCache.delete(k)
+        evicted = true
+        break
+      }
+    }
+    if (!evicted) break
+  }
+  const gate = { at: 0, value: null, promise: null }
+  gate.promise = loader().then(
+    (value) => {
+      gate.promise = null
+      gate.at = Date.now()
+      gate.value = value
+      if (campaignCache.get(key) === gate) campaignCache.set(key, gate)
+      return value
+    },
+    () => {
+      if (campaignCache.get(key) === gate) campaignCache.delete(key)
+      return null
+    },
+  )
+  campaignCache.set(key, gate)
+  return gate.promise
+}
+
+// the per-account key for the local ledgers (usage state + campaign cache):
+// a display name can repeat, so key on the uid, else on the token's hash
+function accountKey(providerId, auth) {
+  const uid = String(auth?.uid ?? auth?.userId ?? "").trim()
+  if (uid) return `${providerId}|uid:${uid}`
+  const token = stripBearer(String(auth?.refresh ?? auth?.access ?? ""))
+  return `${providerId}|tok:${createHash("sha256").update(token).digest("hex").slice(0, 16)}`
+}
+
+// ── the local usage state (this round's spend) ─────────────────────────────
+//
+// A file under magpie's config dir (survives plugin updates, isolated in CI by
+// HOME): `AUTOCLAW_USAGE_STATE_FILE` → `$XDG_CONFIG_HOME/magpie` →
+// `$HOME/.config/magpie` (Windows falls back to USERPROFILE: a bare
+// `${HOME ?? ""}` would write to C:\.config, readable by any local user).
+// Writes go tmp+rename (a concurrent write never leaves half a file), mode
+// 0600; entries untouched for 30 days are dropped.
+let usageStatePath = null
+let usageState = null
+
+function magpieCfgDir() {
+  if (process.env.XDG_CONFIG_HOME) return `${process.env.XDG_CONFIG_HOME.replace(/\/+$/, "")}/magpie`
+  const home =
+    String(process.env.HOME ?? "").trim() || String(process.env.USERPROFILE ?? "").trim() || homedir()
+  return `${home.replace(/[\\/]+$/, "")}/.config/magpie`
+}
+
+function usageStatePathDefault() {
+  if (process.env.AUTOCLAW_USAGE_STATE_FILE) return process.env.AUTOCLAW_USAGE_STATE_FILE
+  return `${magpieCfgDir()}/autoclaw-usage.json`
+}
+
+// tests point this at a temp file; the in-memory copy is dropped so runs don't
+// leak into each other
+function setUsageStatePath(path) {
+  usageStatePath = path || null
+  usageState = null
+}
+
+const currentUsageStatePath = () => usageStatePath ?? usageStatePathDefault()
+
+function usageStateLoad() {
+  if (usageState) return usageState
+  try {
+    usageState = JSON.parse(readFileSync(currentUsageStatePath(), "utf8"))
+    if (!usageState || typeof usageState !== "object" || typeof usageState.accts !== "object") usageState = { accts: {} }
+  } catch {
+    usageState = { accts: {} }
+  }
+  return usageState
+}
+
+const USAGE_STATE_TTL_MS = 30 * 86400 * 1000
+
+function usageStateSave() {
+  try {
+    const now = Date.now()
+    for (const [key, value] of Object.entries(usageState.accts)) {
+      const at = Date.parse(value?.at ?? "")
+      if (!Number.isFinite(at) || now - at > USAGE_STATE_TTL_MS) delete usageState.accts[key]
+    }
+    const path = currentUsageStatePath()
+    mkdirSync(dirname(path), { recursive: true })
+    const tmp = `${path}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify(usageState), { mode: 0o600 })
+    renameSync(tmp, path)
+  } catch {}
+}
+
+// the vendor's day runs on Beijing time
+const beijingDayOf = (d = new Date()) => new Date(d.getTime() + 8 * 3600e3).toISOString().slice(0, 10)
+
+// one balance observation → { peak, used, daySpent, dayGained }. Any rise
+// (total > last balance, including from 0) starts a new round: peak = total,
+// used = 0. Not waiting to pass the old peak matters because the daily reward
+// often lands after the spending. daySpent/dayGained are Beijing-day sums.
+function balanceObserve(key, total) {
+  const state = usageStateLoad()
+  const day = beijingDayOf()
+  const prev = state.accts[key] ?? {}
+  const last = Number(prev.balance)
+  const sameDay = prev.day === day
+  let daySpent = sameDay ? Number(prev.daySpent) || 0 : 0
+  let dayGained = sameDay ? Number(prev.dayGained) || 0 : 0
+  let peak
+  if (Number.isFinite(last) && total > last) {
+    dayGained += total - last
+    peak = total
+  } else {
+    peak = Number(prev.peak)
+    if (!Number.isFinite(peak) || peak <= 0 || total > peak) peak = total
+    if (Number.isFinite(last) && total < last) daySpent += last - total
+  }
+  const used = Math.max(0, peak - total)
+  state.accts[key] = { peak, balance: total, day, daySpent, dayGained, at: new Date().toISOString() }
+  usageStateSave()
+  return { peak, used, daySpent, dayGained }
+}
+
 // ── the plugin ─────────────────────────────────────────────────────────────
 
 export async function AutoClawAuthPlugin({ client } = {}) {
@@ -857,7 +1327,10 @@ export async function AutoClawAuthPlugin({ client } = {}) {
             try {
               cred = await fresh(getAuth)
             } catch (e) {
-              return errorResponse(e instanceof SignedOut || e?.signIn === "expired" ? 401 : 502, String(e?.message ?? e))
+              const message = String(e?.message ?? e)
+              return e instanceof SignedOut || e?.signIn === "expired"
+                ? refusalResponse(401, message, "expired")
+                : errorResponse(502, message)
             }
             const ask = (token) =>
               fetch(`${upstreamBase()}/chat/completions`, {
@@ -883,11 +1356,26 @@ export async function AutoClawAuthPlugin({ client } = {}) {
                 })
                 res = await ask(cred.access)
               } catch (e) {
-                return errorResponse(e instanceof SignedOut || e?.signIn === "expired" ? 401 : 502, String(e?.message ?? e))
+                const message = String(e?.message ?? e)
+                return e instanceof SignedOut || e?.signIn === "expired"
+                  ? refusalResponse(401, message, "expired")
+                  : errorResponse(502, message)
               }
             }
-            if (!res.ok)
-              return errorResponse(res.status, `AutoClaw 上游返回 ${res.status}: ${(await res.text().catch(() => "")).slice(0, 4096) || "无错误说明"}`)
+            if (!res.ok) {
+              const body = await res.text().catch(() => "")
+              // a 403 that is a spent quota or a banned account is not the
+              // sign-in: keep it, pass the vendor's words on (quota → 429)
+              const refusal = readRefusal(res.status, body)
+              if (refusal?.kind === "quota")
+                return refusalResponse(429, `AutoClaw: ${refusal.message || "额度已用完"}`, "kept", "rate_limit_error")
+              if (refusal?.kind === "banned")
+                return refusalResponse(403, `AutoClaw: ${refusal.message || "账号被封禁"}`, "kept", "permission_error")
+              const message = `AutoClaw 上游返回 ${res.status}: ${body.slice(0, 4096) || "无错误说明"}`
+              return res.status === 401 || res.status === 403
+                ? refusalResponse(res.status, message, "expired")
+                : errorResponse(res.status, message)
+            }
             return rewriteModel(res, route.requested)
           },
         }
@@ -896,43 +1384,130 @@ export async function AutoClawAuthPlugin({ client } = {}) {
         try {
           const a = await fresh(getAuth)
           const token = a.access
-          let points
+
+          // the wallets: v2 first, the v1 instances as fallback (as before)
+          let walletsPayload = null
+          let isV2 = false
           try {
-            points = await userapiRequest("GET", "/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw", { token })
+            const v2 = await userapiRequest("GET", WALLETS_PATH, { token })
+            if (codeOf(v2) === 0 && Array.isArray(v2?.data?.wallets)) {
+              walletsPayload = v2
+              isV2 = true
+            }
           } catch (e) {
             if (e?.signIn === "expired") throw e
-            points = null
           }
-          let normalized
-          if (points && codeOf(points) === 0 && Array.isArray(points?.data?.wallets)) {
-            normalized = normalizeWallets(points)
-          } else {
-            const legacy = await userapiRequest("GET", "/agent-assetmgr/api/v1/wallet-instances?wallet_type=all&wallet_scope=all", { token })
+          if (!walletsPayload) {
+            const legacy = await userapiRequest("GET", LEGACY_WALLETS_PATH, { token })
             if (codeOf(legacy) !== 0) throw new Error(`积分查询返回异常 code=${codeOf(legacy) ?? "null"}`)
-            normalized = normalizeLegacyWallets(legacy)
+            walletsPayload = legacy
           }
-          const windows = normalized.wallets.map((w) => ({
-            name: w.displayName,
-            used: 0,
-            display: w.balance != null ? `${w.balance} 积分` : "—",
-            aside: true,
-            ...(normalized.wallets.length === 1 ? { amount: w.balance ?? 0, limit: w.balance ?? 0, unit: "积分", resetsAt: beijingMidnight(), span: 86400 } : {}),
-          }))
+          const data = walletsPayload?.data ?? {}
+          // null / "" / non-numeric total is unknown, not 0: Number(null)===0
+          // would record the whole pool as spent (100% used)
+          const rawTotal = data.total_balance
+          if (rawTotal == null || rawTotal === "" || !Number.isFinite(Number(rawTotal)))
+            return { error: "积分响应异常", windows: [] }
+          const total = Number(rawTotal)
+          const named = (isV2 ? normalizeWallets(walletsPayload).wallets : normalizeLegacyWallets(walletsPayload).wallets)
+            .filter((w) => w.balance != null && w.balance > 0 && Math.round(w.balance) !== Math.round(total))
+            .slice(0, 3)
+
+          // the daily check-in's state (a task-list read; unreadable = no row)
+          let signin = null
+          try {
+            const tasks = await callTaskList(token)
+            const task = Array.isArray(tasks) ? tasks.find((t) => t?.task_id === DAILY_SIGNIN_TASK_ID) : null
+            if (task) signin = { status: String(task.status ?? ""), reward: toNum(task.reward_points) ?? 0 }
+          } catch {}
+
+          const track = balanceObserve(accountKey(ID, a), total)
+
+          const windows = []
+          // this round's spend: `used` is a percentage since the balance last
+          // rose; amount/limit are raw points. aside: display-only, routing
+          // reads the balance window below.
+          if (track.used > 0) {
+            const pct = track.peak > 0 ? Math.min(100, Math.round((track.used / track.peak) * 1000) / 10) : 0
+            windows.push({
+              name: "本轮消耗",
+              aside: true,
+              used: pct,
+              amount: Math.round(track.used),
+              limit: Math.round(track.peak),
+              display:
+                `${fmtPoints(track.used)} / ${fmtPoints(track.peak)} 积分` +
+                (track.daySpent > 0 ? ` · 今日 -${fmtPoints(track.daySpent)}` : "") +
+                (track.dayGained > 0 ? ` · 今日 +${fmtPoints(track.dayGained)}` : ""),
+            })
+          }
+          // the check-in row only expresses state (used stays 0)
+          if (signin) {
+            windows.push({
+              name: "每日签到",
+              used: 0,
+              aside: true,
+              display:
+                signin.status === "completed"
+                  ? `今日已签 ✓${signin.reward ? ` +${fmtPoints(signin.reward)}` : ""}`
+                  : `今日未签${signin.reward ? `（+${fmtPoints(signin.reward)}）` : ""}`,
+            })
+          }
+          // points are a pure balance: no total/no used. This window is the one
+          // routing reads (magpie >= v0.1.1790).
+          const balanceWindow = { name: "积分余额", balance: total, unit: "积分" }
+          windows.push(balanceWindow)
+
+          // the campaign row: display-only, any failure omits it
+          let campaignRow = null
+          try {
+            const entries = await campaignCached(accountKey(ID, a), () => fetchCampaignLedger(token))
+            const camp = campaignBreakdown(entries)
+            // when part of the activity stock lapses soon, mark the moment on
+            // the balance window (never a second balance-bearing window)
+            if (camp?.lapseAt && camp.lapsing > 0 && total > 0)
+              Object.assign(balanceWindow, {
+                runsOutAt: new Date(camp.lapseAt).toISOString(),
+                runsOut: Math.min(total, camp.lapsing),
+              })
+            if (camp && (camp.claimed > 0 || camp.expired > 0)) {
+              const label =
+                camp.labels.length === 1
+                  ? `（${camp.labels[0].slice(0, 40)}）`
+                  : camp.labels.length > 1
+                    ? `（${camp.labels.length} 个活动）`
+                    : ""
+              const text = [`剩 ${fmtPoints(camp.remaining)}${label}`, `已领 ${fmtPoints(camp.claimed)}`, `过期 ${fmtPoints(camp.expired)}`].join(" · ")
+              campaignRow = { name: "活动积分", used: 0, aside: true, display: `${text}（近期）` }
+            }
+          } catch {}
+          if (campaignRow) windows.push(campaignRow)
+
           // the web shortcut last: `used` is omitted on purpose (unreported =
-          // no share, not 0%), and `aside` says an exhausted window never
-          // makes the account unusable. The token is the post-fresh() one, so
-          // the link stays valid for at least REFRESH_LEAD.
+          // no share, not 0%). The token is the post-fresh() one, so the link
+          // stays valid for at least REFRESH_LEAD.
           windows.push({ name: WEB_ENTRY_WINDOW, display: webEntryUrl(token), aside: true })
-          return { plan: NAME, user: a.name || a.accountId, windows, signIn: "kept" }
+
+          const parts = named.map((w) => `${w.displayName} ${fmtPoints(w.balance)}`)
+          return {
+            plan: NAME,
+            user: a.name || a.accountId,
+            balance: `${fmtPoints(total)} 积分${parts.length ? `（${parts.join(" · ")}）` : ""}`,
+            windows,
+            signIn: "kept",
+          }
         } catch (e) {
           return { error: String(e?.message ?? e), signIn: e?.signIn === "expired" ? "expired" : "kept" }
         }
       },
-      // the two daily rewards: press `autoclaw-task-complete` once per task
-      // with the same token (sign-in first, then the inspiration center). The
+      // the daily flow: campaign ledger (today's payout already in? read
+      // before, confirm after) → user-info (the login event that pays the
+      // activity reward, best effort, skipped when already paid) → task-list
+      // (skip what is already done) → press the remaining task(s). The two
       // tasks are independent — a non-auth failure of one never blocks the
-      // other — while any auth failure (401 / 410000 / SignedOut) ends the
-      // whole check-in as expired so magpie asks for a new sign-in.
+      // other — while an auth failure (401 / 410000 / SignedOut) ends the whole
+      // check-in as expired. A 403 that is a spent quota or a banned account is
+      // thrown as-is with signIn "kept".
       async checkin(getAuth) {
         // via fresh(): a near-expiry token renews itself here instead of
         // failing the check-in with "请重新登录" (same shape as raccoon's)
@@ -943,6 +1518,52 @@ export async function AutoClawAuthPlugin({ client } = {}) {
           // a renewal failure keeps its own 「失效」 wording (and signIn)
           if (e instanceof SignedOut) throw expired("AutoClaw：未登录")
           throw e
+        }
+
+        // ① the activity payout, confirmed instead of assumed: read today's
+        // campaign ledger first (live, not the display cache). A payout
+        // already there means the desktop client opening paid it — the login
+        // event is skipped. Otherwise it is triggered on the configured base
+        // then the domestic account domain, and the ledger is read back so the
+        // message reports what actually landed. Never blocks the check-in.
+        let ledger = await readCampaignForCheckin(a.access)
+        let reward = todayActivityReward(ledger)
+        let uiReached = false
+        if (!reward) {
+          const deviceId = accountDeviceId(a, a.access, a.refresh)
+          for (const base of userInfoBases()) {
+            const ui = await callUserInfo(a.access, deviceId, base)
+            if (ui?.ok && ui.code === 0) {
+              uiReached = true
+              break
+            }
+          }
+          // the reward may have just landed: drop the cached campaign ledger
+          // (usage re-reads it) and read it back to confirm the payout
+          if (uiReached) {
+            campaignCache.delete(accountKey(ID, a))
+            ledger = await readCampaignForCheckin(a.access)
+            reward = todayActivityReward(ledger)
+          }
+        }
+        // the activity segment appended after the task results: a payout with
+        // its labels, the miss note only for a readable ledger with no payout
+        // and an unreached login event (unknown is not 「未触发」), nothing
+        // when it landed or could not be read
+        const rewardText = reward
+          ? `活动奖励已到账 +${fmtPoints(reward.amount)}${
+              reward.labels.length === 1
+                ? `（${reward.labels[0]}）`
+                : reward.labels.length > 1
+                  ? `（${reward.labels.length} 个活动）`
+                  : ""
+            }`
+          : !uiReached && ledger !== null
+            ? "活动奖励未触发（登录未上报）"
+            : ""
+        const note = (result) => {
+          if (!rewardText) return result
+          return { ...result, message: result.message ? `${result.message}；${rewardText}` : rewardText }
         }
 
         // one task's press → { kind:"claimed", reward } | { kind:"done" } |
@@ -967,8 +1588,32 @@ export async function AutoClawAuthPlugin({ client } = {}) {
           return { kind: "done" }
         }
 
-        const signin = await press(DAILY_SIGNIN_TASK_ID)
-        const inspiration = await press(INSPIRATION_TASK_ID)
+        // ② the task list: an answered list drives which tasks to press; an
+        // unanswered one (network / 5xx / non-envelope) falls back to pressing
+        // both, as before (the endpoint is idempotent). 401/403 throw.
+        let tasks = null
+        try {
+          tasks = await callTaskList(a.access)
+        } catch (e) {
+          if (e?.signIn === "kept" || e?.banned || e?.quota || e?.signIn === "expired") throw e
+          tasks = null
+        }
+
+        let signin
+        let inspiration
+        if (Array.isArray(tasks)) {
+          if (!tasks.length) return note({ outcome: "inactive", message: "当前没有签到活动" })
+          const signinTask = tasks.find((t) => t?.task_id === DAILY_SIGNIN_TASK_ID)
+          const inspirationTask = tasks.find((t) => t?.task_id === INSPIRATION_TASK_ID)
+          if (!signinTask && !inspirationTask) return note({ outcome: "inactive", message: "当前没有签到活动" })
+          const skipped = { kind: "done" }
+          signin = !signinTask || String(signinTask.status ?? "") === "completed" ? skipped : await press(DAILY_SIGNIN_TASK_ID)
+          inspiration =
+            !inspirationTask || String(inspirationTask.status ?? "") === "completed" ? skipped : await press(INSPIRATION_TASK_ID)
+        } else {
+          signin = await press(DAILY_SIGNIN_TASK_ID)
+          inspiration = await press(INSPIRATION_TASK_ID)
+        }
 
         const credit = (signin.reward ?? 0) + (inspiration.reward ?? 0)
         const signinText =
@@ -993,7 +1638,7 @@ export async function AutoClawAuthPlugin({ client } = {}) {
             : signin.kind === "failed" || inspiration.kind === "failed"
               ? "failed"
               : "done"
-        return { outcome, credit, message: `${signinText}；${inspirationText}` }
+        return note({ outcome, credit, message: `${signinText}；${inspirationText}` })
       },
       methods,
     },
@@ -1086,7 +1731,45 @@ export const _internal = {
   webEntryUrl,
   INSPIRATION_TASK_ID,
   WEB_ENTRY_WINDOW,
+  TASK_LIST_PATH,
+  WALLETS_PATH,
+  LEGACY_WALLETS_PATH,
+  CAMPAIGN_LEDGER_PATH,
+  DESKTOP_UA,
+  DESKTOP_VERSION,
+  DESKTOP_TM,
+  DESKTOP_CHANNEL,
+  QUOTA_CODES,
+  QUOTA_WORDS,
+  BANNED_CODES,
+  BANNED_WORDS,
+  readRefusal,
+  refusalFields,
+  refusalResponse,
+  callUserInfo,
+  userInfoBases,
+  userInfoAltBase,
+  callTaskList,
+  jwtClaim,
   jwtEnd,
+  accountDeviceId,
+  accountKey,
+  campaignLabel,
+  campaignBreakdown,
+  fetchCampaignLedger,
+  ACTIVITY_EVENT_PREFIXES,
+  ACTIVITY_ID_PREFIXES,
+  todayActivityReward,
+  readCampaignForCheckin,
+  campaignCached,
+  campaignCache,
+  fmtPoints,
+  setUsageStatePath,
+  usageStatePath: currentUsageStatePath,
+  usageStatePathDefault,
+  magpieCfgDir,
+  balanceObserve,
+  beijingDayOf,
   stripBearer,
   toNum,
   beijingMidnight,
