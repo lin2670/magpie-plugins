@@ -3,8 +3,9 @@
 //
 // Signs in with an AutoClaw account (domestic phone + SMS code, an agent2api
 // import, or pasted tokens), forwards chat completions to its zhipuai
-// acceleration proxy, lists its models, reads its point wallets, and presses
-// the daily sign-in (the 「每日签到」 banner's task). Request shapes are ported
+// acceleration proxy, lists its models, reads its point wallets, presses both
+// of the client's daily tasks (「每日签到」 and the inspiration center), and
+// offers the web app's `?autoglm_token=` shortcut as a usage window. Request shapes are ported
 // from aimod-cc/agent2api (MIT), providers/autoclaw, rewritten for magpie's
 // plugin API.
 //
@@ -69,6 +70,16 @@ const CN_HOST = "https://autoglm-acceleration-api.zhipuai.cn"
 const userapiBase = () => env("AUTOCLAW_USERAPI_BASE_URL", CN_HOST)
 const upstreamBase = () => env("AUTOCLAW_UPSTREAM_BASE_URL", `${CN_HOST}/autoclaw-proxy/proxy/autoclaw`)
 
+// the web app. The browser's checkToken() reads `?autoglm_token=`, Bearer-izes
+// it and stores it as the web session, so the access token this plugin keeps is
+// already a password-less web entry (the vendor's own invite links carry it).
+const CN_WEB_HOST = "https://autoglm.zhipuai.cn"
+const webBase = () => env("AUTOCLAW_WEB_BASE_URL", CN_WEB_HOST)
+const webEntryUrl = (access) => `${webBase()}/?autoglm_token=${encodeURIComponent(stripBearer(access))}`
+// the usage window that carries the link (host.js has no url field: `display`
+// is the only always-visible slot, and `aside` keeps it out of availability)
+const WEB_ENTRY_WINDOW = "网页版快捷登录"
+
 // the config base: the desktop client slices the proxy base at its last
 // `/proxy/` and re-appends it, dropping the tail `/autoclaw` (agent2api
 // catalog::config_base_url)
@@ -98,10 +109,12 @@ const REFRESH_FALLBACK_CODE = 400_002
 const REQUEST_TIMEOUT = 20_000
 const LLM_TIMEOUT = 900_000
 
-// the daily sign-in is a task in the client's generic task system
+// both daily rewards are tasks in the client's generic task system: the
+// 「每日签到」 banner and the inspiration center's entry trigger press the same
+// `task-complete` endpoint (one idempotent state per task per day)
 const DAILY_SIGNIN_TASK_ID = "daily_signin"
+const INSPIRATION_TASK_ID = "daily_inspiration_center"
 const TASK_COMPLETE_PATH = "/autoclaw-proxy/proxy/autoclaw-task-complete"
-const TASK_LIST_PATH = "/autoclaw-proxy/proxy/autoclaw-task-list"
 
 // ── small helpers ──────────────────────────────────────────────────────────
 
@@ -905,15 +918,21 @@ export async function AutoClawAuthPlugin({ client } = {}) {
             aside: true,
             ...(normalized.wallets.length === 1 ? { amount: w.balance ?? 0, limit: w.balance ?? 0, unit: "积分", resetsAt: beijingMidnight(), span: 86400 } : {}),
           }))
+          // the web shortcut last: `used` is omitted on purpose (unreported =
+          // no share, not 0%), and `aside` says an exhausted window never
+          // makes the account unusable. The token is the post-fresh() one, so
+          // the link stays valid for at least REFRESH_LEAD.
+          windows.push({ name: WEB_ENTRY_WINDOW, display: webEntryUrl(token), aside: true })
           return { plan: NAME, user: a.name || a.accountId, windows, signIn: "kept" }
         } catch (e) {
           return { error: String(e?.message ?? e), signIn: e?.signIn === "expired" ? "expired" : "kept" }
         }
       },
-      // the daily sign-in: the client's 「每日签到」 banner presses
-      // `autoclaw-task-complete` with `task_id: daily_signin`; the reply's
-      // `reward_points > 0` (or an explicit success) means this press earned
-      // something, while `already_completed` means today was already taken.
+      // the two daily rewards: press `autoclaw-task-complete` once per task
+      // with the same token (sign-in first, then the inspiration center). The
+      // tasks are independent — a non-auth failure of one never blocks the
+      // other — while any auth failure (401 / 410000 / SignedOut) ends the
+      // whole check-in as expired so magpie asks for a new sign-in.
       async checkin(getAuth) {
         // via fresh(): a near-expiry token renews itself here instead of
         // failing the check-in with "请重新登录" (same shape as raccoon's)
@@ -921,45 +940,60 @@ export async function AutoClawAuthPlugin({ client } = {}) {
         try {
           a = await fresh(getAuth)
         } catch (e) {
-          throw e instanceof SignedOut || e?.signIn === "expired" ? expired("AutoClaw：未登录") : e
+          // a renewal failure keeps its own 「失效」 wording (and signIn)
+          if (e instanceof SignedOut) throw expired("AutoClaw：未登录")
+          throw e
         }
-        let payload
-        try {
-          payload = await userapiRequest("POST", TASK_COMPLETE_PATH, { token: a.access, body: { task_id: DAILY_SIGNIN_TASK_ID } })
-        } catch (e) {
-          if (e?.signIn === "expired" || e instanceof SignedOut) throw expired("AutoClaw 登录态已失效，无法签到（请重新登录）")
-          return { outcome: "failed", message: `签到失败：${e?.message ?? e}` }
-        }
-        const code = codeOf(payload)
-        if (code != null && AUTH_EXPIRED_CODES.has(code)) throw expired("AutoClaw 登录态已失效，无法签到（请重新登录）")
-        if (code != null && code !== 0) {
-          // not an auth problem: ask the task list why (未开始/不在时段/任务下线…)
-          let why = ""
+
+        // one task's press → { kind:"claimed", reward } | { kind:"done" } |
+        // { kind:"failed", reason }; auth failures throw expired
+        const press = async (taskId) => {
+          let payload
           try {
-            const list = await userapiRequest("GET", TASK_LIST_PATH, { token: a.access })
-            const tasks = list?.data?.taskList ?? list?.data?.tasks ?? list?.data ?? []
-            const mine = Array.isArray(tasks) ? tasks.find((t) => t?.task_id === DAILY_SIGNIN_TASK_ID || t?.taskId === DAILY_SIGNIN_TASK_ID || t?.id === DAILY_SIGNIN_TASK_ID) : null
-            const status = mine?.status ?? mine?.state
-            if (status != null) why = `（任务状态 ${status}${mine?.statusDesc || mine?.description ? `：${mine.statusDesc || mine.description}` : ""}）`
-          } catch {}
-          return { outcome: "failed", message: `签到失败：${payload?.msg ?? `code=${code}`}${why}` }
-        }
-        const data = payload?.data ?? {}
-        const already = data.already_completed === true
-        const saidSuccess = data.success === true
-        const reward = toNum(data.reward_points) ?? 0
-        if (reward > 0 || (saidSuccess && !already)) {
-          return {
-            outcome: "claimed",
-            credit: reward || undefined,
-            message: reward > 0 ? `签到成功，获得 ${reward} 积分` : "签到成功",
+            payload = await userapiRequest("POST", TASK_COMPLETE_PATH, { token: a.access, body: { task_id: taskId } })
+          } catch (e) {
+            if (e?.signIn === "expired" || e instanceof SignedOut) throw expired("AutoClaw 登录态已失效，无法签到（请重新登录）")
+            return { kind: "failed", reason: String(e?.message ?? e) }
           }
+          const code = codeOf(payload)
+          if (code != null && AUTH_EXPIRED_CODES.has(code)) throw expired("AutoClaw 登录态已失效，无法签到（请重新登录）")
+          // a business error is passed through as-is (task not started/offline):
+          // no guessing, no retry
+          if (code != null && code !== 0) return { kind: "failed", reason: String(payload?.msg ?? `code=${code}`) }
+          const data = payload?.data ?? {}
+          const already = data.already_completed === true
+          const reward = toNum(data.reward_points) ?? 0
+          if (reward > 0 || (data.success === true && !already)) return { kind: "claimed", reward }
+          return { kind: "done" }
         }
-        return {
-          outcome: "done",
-          credit: reward || undefined,
-          message: already ? "今天已签到" : "签到未领取（上游未发放积分）",
-        }
+
+        const signin = await press(DAILY_SIGNIN_TASK_ID)
+        const inspiration = await press(INSPIRATION_TASK_ID)
+
+        const credit = (signin.reward ?? 0) + (inspiration.reward ?? 0)
+        const signinText =
+          signin.kind === "claimed"
+            ? signin.reward > 0
+              ? `签到成功，获得 ${signin.reward} 积分`
+              : "签到成功"
+            : signin.kind === "done"
+              ? "今天已签到"
+              : `签到失败：${signin.reason}`
+        const inspirationText =
+          inspiration.kind === "claimed"
+            ? inspiration.reward > 0
+              ? `灵感中心已领取 ${inspiration.reward} 积分`
+              : "灵感中心已领取"
+            : inspiration.kind === "done"
+              ? "灵感中心今日已领"
+              : `灵感中心：${inspiration.reason}`
+        const outcome =
+          signin.kind === "claimed" || inspiration.kind === "claimed"
+            ? "claimed"
+            : signin.kind === "failed" || inspiration.kind === "failed"
+              ? "failed"
+              : "done"
+        return { outcome, credit, message: `${signinText}；${inspirationText}` }
       },
       methods,
     },
@@ -1048,6 +1082,10 @@ export const _internal = {
   configBase,
   userapiBase,
   upstreamBase,
+  webBase,
+  webEntryUrl,
+  INSPIRATION_TASK_ID,
+  WEB_ENTRY_WINDOW,
   jwtEnd,
   stripBearer,
   toNum,

@@ -232,35 +232,122 @@ describe("renewal", () => {
 })
 
 describe("checkin", () => {
-  test("the first press of the day earns the points", async () => {
+  // the two daily tasks, in press order
+  const pressed = () => fake.state.taskCalls.map((c) => c.task_id)
+
+  test("the first press claims both daily tasks", async () => {
     const result = await plugin.auth.checkin(getAuth)
     expect(result.outcome).toBe("claimed")
-    expect(result.credit).toBe(200)
-    expect(result.message).toContain("200")
-    expect(fake.state.taskCalls[0].task_id).toBe("daily_signin")
+    expect(result.credit).toBe(400)
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+    expect(result.message).toContain("签到成功，获得 200 积分")
+    expect(result.message).toContain("灵感中心已领取 200 积分")
   })
 
-  test("a second press is 'done', not 'claimed'", async () => {
+  test("a second press the same day is 'done' for both", async () => {
     await plugin.auth.checkin(getAuth)
     const again = await plugin.auth.checkin(getAuth)
     expect(again.outcome).toBe("done")
+    expect(again.credit).toBe(0)
     expect(again.message).toContain("已签到")
+    expect(again.message).toContain("灵感中心")
+  })
+
+  test("a failing inspiration task does not block the sign-in credit", async () => {
+    fake.state.inspirationError = 400_001
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(200)
+    expect(result.message).toContain("签到成功，获得 200 积分")
+    // the upstream's own reason is passed through, not guessed
+    expect(result.message).toContain("灵感中心任务暂不可用")
+    // the second task was still pressed
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+  })
+
+  test("a failing sign-in task does not block the inspiration credit", async () => {
+    fake.state.signinError = 500_001
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(200)
+    expect(result.message).toContain("签到失败")
+    expect(result.message).toContain("灵感中心已领取 200 积分")
+  })
+
+  test("both tasks failing is 'failed'", async () => {
+    fake.state.signinError = 500_001
+    fake.state.inspirationError = 400_001
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("failed")
+    expect(result.credit).toBe(0)
+    expect(result.message).toContain("签到失败")
+    expect(result.message).toContain("灵感中心任务暂不可用")
+  })
+
+  test("an auth business code on the second task ends the check-in as expired", async () => {
+    fake.state.inspirationError = 410_000
+    await expect(plugin.auth.checkin(getAuth)).rejects.toThrow(/失效/)
+    // the expired press stops there: nothing more is attempted
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
   })
 
   test("an expired sign-in says so", async () => {
-    saved = { type: "oauth", access: "gone", refresh: "wrong", expires: Date.now() + 3600e3 }
+    // a spent refresh token: the near-expiry renewal is what fails
+    saved = { type: "oauth", access: "stale", refresh: "wrong", expires: Date.now() + 1_000 }
     await expect(plugin.auth.checkin(getAuth)).rejects.toThrow(/失效/)
   })
 })
 
 describe("usage", () => {
-  test("the point wallets, hidden ones dropped", async () => {
+  const webWindow = (usage) => usage.windows.find((w) => w.name === "网页版快捷登录")
+
+  test("the point wallets, hidden ones dropped, the web entry last", async () => {
     const usage = await plugin.auth.usage(getAuth)
     expect(usage.signIn).toBe("kept")
-    expect(usage.windows.map((w) => w.name)).toEqual(["赠送积分", "通用积分"])
+    expect(usage.windows.map((w) => w.name)).toEqual(["赠送积分", "通用积分", "网页版快捷登录"])
     expect(usage.windows[0].display).toBe("200 积分")
     expect(usage.windows[1].display).toBe("12500 积分")
+    // the hidden wallet (display:false) is still dropped
+    expect(usage.windows.map((w) => w.display)).not.toContain("999 积分")
     expect(fake.state.walletCalls).toBe(1)
+  })
+
+  test("the web entry carries the access token and only whitelisted fields", async () => {
+    const usage = await plugin.auth.usage(getAuth)
+    const web = webWindow(usage)
+    expect(web.aside).toBe(true)
+    expect(web.used).toBeUndefined()
+    expect(web.display).toBe(`https://autoglm.zhipuai.cn/?autoglm_token=${encodeURIComponent(fake.state.access)}`)
+    // host.js drops unknown window fields: nothing invented
+    expect(Object.keys(web).sort()).toEqual(["aside", "display", "name"])
+  })
+
+  test("a near-expiry token renews first, and the link carries the renewed one", async () => {
+    saved = { type: "oauth", access: "stale-token", refresh: fake.state.refresh, deviceId: fake.state.deviceId, expires: Date.now() + 30_000 }
+    const usage = await plugin.auth.usage(getAuth)
+    expect(fake.state.refreshCalls.length).toBe(1)
+    expect(saved.access).toBe(fake.state.access)
+    const web = webWindow(usage)
+    expect(web.display).toContain(`autoglm_token=${encodeURIComponent(fake.state.access)}`)
+    expect(web.display).not.toContain("stale-token")
+  })
+
+  test("AUTOCLAW_WEB_BASE_URL overrides the web host", async () => {
+    process.env.AUTOCLAW_WEB_BASE_URL = "https://web.example.test/"
+    try {
+      const usage = await plugin.auth.usage(getAuth)
+      expect(webWindow(usage).display.startsWith("https://web.example.test/?autoglm_token=")).toBe(true)
+    } finally {
+      delete process.env.AUTOCLAW_WEB_BASE_URL
+    }
+  })
+
+  test("a failing usage keeps {error, signIn} and adds no window", async () => {
+    saved = { type: "oauth", access: "gone", refresh: "wrong", expires: Date.now() + 3600e3 }
+    const usage = await plugin.auth.usage(getAuth)
+    expect(usage.error).toBeTruthy()
+    expect(usage.signIn).toBe("expired")
+    expect(usage.windows).toBeUndefined()
   })
 })
 
@@ -341,6 +428,13 @@ describe("helpers", () => {
 
   test("catalog base sits one level above the chat proxy", () => {
     expect(_internal.configBase()).toBe(`${fake.base}/autoclaw-proxy/proxy/`)
+  })
+
+  test("the web entry URL is the web host plus an encoded token", () => {
+    expect(_internal.webBase()).toBe("https://autoglm.zhipuai.cn")
+    expect(_internal.webEntryUrl("a+b/c=")).toBe(`https://autoglm.zhipuai.cn/?autoglm_token=${encodeURIComponent("a+b/c=")}`)
+    // a pasted "Bearer " prefix never reaches the link
+    expect(_internal.webEntryUrl("Bearer tok")).toBe("https://autoglm.zhipuai.cn/?autoglm_token=tok")
   })
 
   test("foreign identities rewrite case-insensitively, longest first", () => {

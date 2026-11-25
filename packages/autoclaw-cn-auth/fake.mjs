@@ -25,6 +25,11 @@ export function fakeAutoClaw() {
     access: jwt(Math.floor(Date.now() / 1000) + 3600, "20260001", "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"),
     refresh: "refresh-1",
     signinDone: false,
+    inspirationDone: false,
+    // a non-auth business failure for one task (0 = healthy): the plugin must
+    // report it and still press the other task
+    signinError: 0,
+    inspirationError: 0,
     // when true, /userapi/v1/refresh answers 400002 and the plugin must
     // degrade to /userapi/v1/agent-refresh
     refreshNeedsFallback: false,
@@ -41,6 +46,9 @@ export function fakeAutoClaw() {
     lastAuthHeader: null,
     reset() {
       state.signinDone = false
+      state.inspirationDone = false
+      state.signinError = 0
+      state.inspirationError = 0
       state.refreshNeedsFallback = false
       state.sendCodeCalls = []
       state.loginCalls = []
@@ -149,15 +157,28 @@ export function fakeAutoClaw() {
 
         if (path === "/autoclaw-proxy/proxy/autoclaw-task-complete") {
           state.taskCalls.push(body)
-          if (body.task_id !== "daily_signin") return json(200, { code: 400_001, msg: "参数错误" })
-          if (state.signinDone)
-            return json(200, { code: 0, msg: "ok", data: { already_completed: true, reward_points: 0, success: false, task_id: "daily_signin" } })
-          state.signinDone = true
-          return json(200, { code: 0, msg: "ok", data: { already_completed: false, reward_points: 200, success: true, task_id: "daily_signin" } })
+          const id = body.task_id
+          if (id !== "daily_signin" && id !== "daily_inspiration_center") return json(200, { code: 400_001, msg: "参数错误" })
+          // each task has its own idempotent state and its own failure switch
+          const inspiration = id === "daily_inspiration_center"
+          const error = inspiration ? state.inspirationError : state.signinError
+          if (error) return json(200, { code: error, msg: inspiration ? "灵感中心任务暂不可用" : "签到任务暂不可用" })
+          if (inspiration ? state.inspirationDone : state.signinDone)
+            return json(200, { code: 0, msg: "ok", data: { already_completed: true, reward_points: 0, success: false, task_id: id } })
+          if (inspiration) state.inspirationDone = true
+          else state.signinDone = true
+          return json(200, { code: 0, msg: "ok", data: { already_completed: false, reward_points: 200, success: true, task_id: id } })
         }
 
         if (path === "/autoclaw-proxy/proxy/autoclaw-task-list") {
-          return json(200, { code: 0, msg: "ok", data: [{ task_id: "daily_signin", completed: state.signinDone }] })
+          return json(200, {
+            code: 0,
+            msg: "ok",
+            data: [
+              { task_id: "daily_signin", completed: state.signinDone },
+              { task_id: "daily_inspiration_center", completed: state.inspirationDone, client_triggered: true },
+            ],
+          })
         }
 
         return json(404, { code: 400_001, msg: "no route" })

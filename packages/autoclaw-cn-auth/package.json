@@ -1,7 +1,7 @@
 {
   "name": "magpie-autoclaw-cn-auth",
-  "version": "0.1.1",
-  "description": "magpie provider plugin: AutoClaw 国内版 (智谱 autoglm, autoglm-acceleration-api.zhipuai.cn) — chat, models, point wallets and the daily sign-in, ported from aimod-cc/agent2api",
+  "version": "0.2.0",
+  "description": "magpie provider plugin: AutoClaw 国内版 (智谱 autoglm, autoglm-acceleration-api.zhipuai.cn) — chat, models, point wallets, both daily tasks and the web shortcut, ported from aimod-cc/agent2api",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
