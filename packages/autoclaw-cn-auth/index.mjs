@@ -5,7 +5,8 @@
 // import, or pasted tokens), forwards chat completions to its zhipuai
 // acceleration proxy, lists its models, reads its point wallets, presses both
 // of the client's daily tasks (「每日签到」 and the inspiration center), and
-// offers the web app's `?autoglm_token=` shortcut as a usage window. Request shapes are ported
+// points the usage card at the web app's `?autoglm_token=` shortcut (the link
+// itself is printed by the `web` CLI in web.mjs). Request shapes are ported
 // from aimod-cc/agent2api (MIT), providers/autoclaw, rewritten for magpie's
 // plugin API.
 //
@@ -20,6 +21,18 @@
 // today's campaign ledger is read first (a payout already there means the
 // login event is skipped), the trigger is followed by a read-back, and what
 // landed is appended to the check-in message as「活动奖励已到账 +N（…）」.
+//
+// Since 0.5.0 the web-entry window shows a fixed one-line hint instead of the
+// token link (the GUI truncates it and cannot copy it); `web.mjs` prints the
+// link, renewing a near-expiry token first and writing it back under the host's
+// `plugin-auth.json.lock` protocol.
+//
+// Since 0.6.0 the check-in also claims the desktop client's 「签到卡」: the
+// 2.5.x client no longer uses the task list for its daily reward but a separate
+// card (`/asset-operation/api/v1/checkin/card`), worth +300/day, which *stacks*
+// with the two task rewards. The card is read and claimed before the task list,
+// so a day with no task list still pays it; any non-auth failure of the card
+// never blocks the tasks.
 //
 // Two things about this vendor are load-bearing and easy to get wrong:
 //   1. the account domain (login / refresh / points / check-in / model
@@ -91,9 +104,14 @@ const upstreamBase = () => env("AUTOCLAW_UPSTREAM_BASE_URL", `${CN_HOST}/autocla
 const CN_WEB_HOST = "https://autoglm.zhipuai.cn"
 const webBase = () => env("AUTOCLAW_WEB_BASE_URL", CN_WEB_HOST)
 const webEntryUrl = (access) => `${webBase()}/?autoglm_token=${encodeURIComponent(stripBearer(access))}`
-// the usage window that carries the link (host.js has no url field: `display`
-// is the only always-visible slot, and `aside` keeps it out of availability)
+// the usage window that points at the link (host.js has no url field: `display`
+// is the only always-visible slot, and `aside` keeps it out of availability).
+// Since 0.5.0 the display is a fixed hint instead of the link itself: the GUI
+// renders `display` with `white-space: nowrap` in a fixed-width table cell and
+// offers no copy action, so a ~640-char link is unreadable and unusable there.
+// The link moved to `web.mjs` (`bunx magpie-autoclaw-cn-auth web`).
 const WEB_ENTRY_WINDOW = "网页版快捷登录"
+const webEntryHintText = "打开网页版：bunx magpie-autoclaw-cn-auth web"
 
 // the config base: the desktop client slices the proxy base at its last
 // `/proxy/` and re-appends it, dropping the tail `/autoclaw` (agent2api
@@ -131,6 +149,20 @@ const DAILY_SIGNIN_TASK_ID = "daily_signin"
 const INSPIRATION_TASK_ID = "daily_inspiration_center"
 const TASK_COMPLETE_PATH = "/autoclaw-proxy/proxy/autoclaw-task-complete"
 const TASK_LIST_PATH = "/autoclaw-proxy/proxy/autoclaw-task-list"
+
+// the desktop client's 「签到卡」 (2.5.x): an independent daily reward that
+// stacks with the tasks above. `X-Version` is the real app version — measured
+// 2026-11-26, the vendor answers the same card for 1.18.5 and 2.5.3, but the
+// client's own value is the honest one. The claim body is only a stable
+// `client_request_id`, so retries land on the same server-side idempotency key.
+const CHECKIN_CARD_PATH = "/asset-operation/api/v1/checkin/card"
+const CHECKIN_CLAIM_PATH = "/asset-operation/api/v1/checkin/claim"
+const CHECKIN_CARD_VERSION = "2.5.3"
+// the card's business codes (client's checkinCard handlers)
+const CARD_ALREADY_CLAIMED_CODE = 650_304
+const CARD_PROCESSING_CODE = 650_302
+const CARD_NOT_ELIGIBLE_CODE = 650_301
+const CARD_IDENTITY_UNAVAILABLE_CODE = 650_303
 
 // the points routes: v2 wallets (the primary read), its v1 fallback, and the
 // campaign ledger (activity points, display only)
@@ -281,6 +313,131 @@ const codeOf = (payload) => {
   if (typeof n === "number") return n
   if (typeof n === "string" && n.trim() !== "" && Number.isFinite(Number(n))) return Number(n)
   return null
+}
+
+// ── the desktop client's 「签到卡」 (2.5.x) ──────────────────────────────────
+//
+// The 2.5.x client stopped calling the task list for its daily reward and uses
+// a separate card instead: `GET …/checkin/card` reads it (claim state, the day's
+// amount, whether it is visible at all) and `POST …/checkin/claim` takes it,
+// with a single `client_request_id` as the idempotency key. It pays on top of
+// the two task rewards (a desktop day is 500: 200 tasks + 300 card).
+//
+// Its headers are the client's own set: the signed fingerprint plus `X-Version:
+// 2.5.3`, `X-Request-ID` and `Accept: application/json` — and **not**
+// `X-Harness-Type` / `X-Client-Type` (this path is parsed by code that knows
+// nothing about magpie, so the plugin must look like the desktop client).
+function checkinCardHeaders(token, requestId = randomUUID()) {
+  const timestamp = String(Math.max(0, Math.floor(Date.now() / 1000)))
+  const sign = createHash("md5").update(`${AUTH_APP_ID}&${timestamp}&${AUTH_APP_KEY}`).digest("hex")
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    "X-Version": CHECKIN_CARD_VERSION,
+    "X-Product": "autoclaw",
+    "X-Tm": platformTm(),
+    "X-Lang": CLIENT_LANG,
+    "X-Channel": CLIENT_CHANNEL,
+    "X-Auth-Appid": AUTH_APP_ID,
+    "X-Auth-TimeStamp": timestamp,
+    "X-Auth-Sign": sign,
+    "X-Request-ID": requestId,
+  }
+  if (token) headers.authorization = `Bearer ${stripBearer(token)}`
+  return headers
+}
+
+// one card request: the same transport and error shape as userapiRequest
+// (401 → expired, non-2xx → Error, unparseable → Error), with the client's
+// headers above
+async function checkinCardRequest(method, path, { token = "", body, timeoutMs = REQUEST_TIMEOUT } = {}) {
+  const init = { method, headers: checkinCardHeaders(token), signal: AbortSignal.timeout(timeoutMs) }
+  if (body !== undefined) init.body = JSON.stringify(body)
+  let res
+  try {
+    res = await fetch(`${userapiBase()}${path}`, init)
+  } catch (e) {
+    throw new Error(`AutoClaw 请求失败：${e?.message ?? e}`)
+  }
+  if (res.status === 401) throw expired("AutoClaw 登录态已失效，请重新登录")
+  const payload = await res.json().catch(() => null)
+  if (!res.ok) throw new Error(`AutoClaw 接口返回 HTTP ${res.status}${payload?.msg ? `：${payload.msg}` : ""}`)
+  if (!payload || typeof payload !== "object") throw new Error("AutoClaw 接口返回了无法解析的内容")
+  return payload
+}
+
+// the card's gift lifetime: the client's `daily.validity_seconds` from now
+const cardExpiresAt = (seconds) => {
+  const n = toNum(seconds)
+  return n != null && n > 0 ? new Date(Date.now() + n * 1000).toISOString() : null
+}
+
+// `GET …/checkin/card` → the normalized card, or null when the read is not
+// usable (code !== 0: protocol change / server trouble — the caller must not
+// guess or claim). Transport errors throw (the caller degrades to "no card").
+async function readCheckinCard(token) {
+  const payload = await checkinCardRequest("GET", CHECKIN_CARD_PATH, { token })
+  if (codeOf(payload) !== 0) return null
+  const data = payload?.data ?? {}
+  const daily = data?.daily ?? {}
+  const streak = daily?.streak ?? {}
+  const status = String(data?.claim_status ?? "").trim().toLowerCase()
+  return {
+    bizDate: String(data?.biz_date ?? "").trim(),
+    visible: data?.card_visible === true,
+    status,
+    claimable: toNum(data?.total_claimable_amount) ?? 0,
+    claimed: toNum(data?.claimed_amount) ?? 0,
+    dailyAmount: toNum(daily?.amount) ?? 0,
+    streakDays: toNum(streak?.days) ?? toNum(streak?.count) ?? toNum(streak?.streak_days) ?? 0,
+    todayCheckedIn: status === "claimed",
+    expiresAt: cardExpiresAt(daily?.validity_seconds),
+  }
+}
+
+// the claim's amount: the server's own number, else the non-replayed items
+function claimedCardAmount(data) {
+  const explicit = toNum(data?.claimed_amount)
+  if (explicit != null) return explicit
+  const items = Array.isArray(data?.items) ? data.items : []
+  return items.reduce((sum, item) => (item?.replayed === true ? sum : sum + (toNum(item?.amount) ?? 0)), 0)
+}
+
+// `POST …/checkin/claim` → { kind:"claimed", amount } | { kind:"done" } |
+// { kind:"ineligible", reason } | { kind:"failed", reason }. An expired sign-in
+// throws (same semantics as the task segment); everything else is a verdict the
+// check-in reports without retrying.
+async function claimCheckinCard(token, idempotencyKey) {
+  let payload
+  try {
+    payload = await checkinCardRequest("POST", CHECKIN_CLAIM_PATH, { token, body: { client_request_id: idempotencyKey } })
+  } catch (e) {
+    if (e?.signIn === "expired") throw e
+    return { kind: "failed", reason: String(e?.message ?? e) }
+  }
+  const code = codeOf(payload)
+  if (code != null && AUTH_EXPIRED_CODES.has(code)) throw expired("AutoClaw 登录态已失效，无法签到（请重新登录）")
+  const reason = String(payload?.msg ?? payload?.message ?? "").trim() || `code=${code ?? "null"}`
+  // already taken / a claim still in flight: the poll or the next run sees the
+  // final state, so both read as done (never a retry of a write)
+  if (code === CARD_ALREADY_CLAIMED_CODE || code === CARD_PROCESSING_CODE) return { kind: "done" }
+  if (code === CARD_NOT_ELIGIBLE_CODE || code === CARD_IDENTITY_UNAVAILABLE_CODE) return { kind: "ineligible", reason }
+  if (code !== 0) return { kind: "failed", reason }
+  const data = payload?.data ?? {}
+  const result = String(data?.result ?? "").trim()
+  if (result !== "success" && result !== "partial_success") return { kind: "failed", reason: `领取结果异常（${result || "无 result"}）` }
+  const amount = claimedCardAmount(data)
+  return amount > 0 ? { kind: "claimed", amount } : { kind: "done" }
+}
+
+// the claim's idempotency key: stable per account per Beijing day, so magpie's
+// 30-minute retry and repeated 「Check in now」 presses all land on one server
+// key. Derived from the account key and the card's own `biz_date` (sha256 → a
+// UUID shape, version 4, variant 89ab).
+function checkinClientRequestId(key, bizDate) {
+  const hex = createHash("sha256").update(`${key}|${bizDate}`).digest("hex")
+  const variant = ((parseInt(hex.slice(16, 18), 16) & 0x3f) | 0x80).toString(16).padStart(2, "0")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variant}${hex.slice(18, 20)}-${hex.slice(20, 32)}`
 }
 
 // ── a 403 that is not the sign-in ──────────────────────────────────────────
@@ -1011,23 +1168,23 @@ async function readCampaignForCheckin(access) {
   }
 }
 
-// the cache: 10 minutes per account key; failures are not cached (the next
-// usage retries at once), null (protocol change) is; checkin clears it when
-// user-info reached the server (the reward may have just landed). An in-flight
-// read that finishes after an invalidation does not write itself back.
-const CAMPAIGN_TTL_MS = 10 * 60 * 1000
-const CAMPAIGN_CACHE_MAX = 100
-const campaignCache = new Map() // accountKey → { at, value, promise }
+// the cache: 10 minutes per account key and cache instance; failures are not
+// cached (the next usage retries at once), null (protocol change) is; checkin
+// clears it when user-info reached the server or a card was just claimed (the
+// data may have just changed). An in-flight read that finishes after an
+// invalidation does not write itself back.
+const CACHE_TTL_MS = 10 * 60 * 1000
+const CACHE_MAX = 100
 
-function campaignCached(key, loader) {
-  const held = campaignCache.get(key)
+function cachedRead(cache, key, loader) {
+  const held = cache.get(key)
   if (held?.promise) return held.promise
-  if (held && Date.now() - held.at < CAMPAIGN_TTL_MS) return Promise.resolve(held.value)
-  while (campaignCache.size >= CAMPAIGN_CACHE_MAX) {
+  if (held && Date.now() - held.at < CACHE_TTL_MS) return Promise.resolve(held.value)
+  while (cache.size >= CACHE_MAX) {
     let evicted = false
-    for (const [k, gate] of campaignCache) {
+    for (const [k, gate] of cache) {
       if (!gate.promise) {
-        campaignCache.delete(k)
+        cache.delete(k)
         evicted = true
         break
       }
@@ -1040,17 +1197,27 @@ function campaignCached(key, loader) {
       gate.promise = null
       gate.at = Date.now()
       gate.value = value
-      if (campaignCache.get(key) === gate) campaignCache.set(key, gate)
+      if (cache.get(key) === gate) cache.set(key, gate)
       return value
     },
     () => {
-      if (campaignCache.get(key) === gate) campaignCache.delete(key)
+      if (cache.get(key) === gate) cache.delete(key)
       return null
     },
   )
-  campaignCache.set(key, gate)
+  cache.set(key, gate)
   return gate.promise
 }
+
+const campaignCache = new Map() // accountKey → { at, value, promise }
+
+const campaignCached = (key, loader) => cachedRead(campaignCache, key, loader)
+
+// the check-in card's amount for the 每日签到 row: its own cache and key space
+// (the campaign ledger and the card change at different moments)
+const cardCache = new Map() // accountKey → { at, value, promise }
+
+const cardCached = (key, loader) => cachedRead(cardCache, key, loader)
 
 // the per-account key for the local ledgers (usage state + campaign cache):
 // a display name can repeat, so key on the uid, else on the token's hash
@@ -1385,6 +1552,15 @@ export async function AutoClawAuthPlugin({ client } = {}) {
           const a = await fresh(getAuth)
           const token = a.access
 
+          // the desktop client's check-in card: started here so it runs in
+          // parallel with the wallet / task-list / ledger reads below (it only
+          // feeds the 每日签到 row). Cached 10 minutes per account, an
+          // unreadable card is null and leaves the row as it was.
+          const cardPromise = cardCached(accountKey(ID, a), () => readCheckinCard(token))
+          // the campaign ledger likewise starts now and is awaited by its row
+          // (failures resolve null: no row, no cache entry)
+          const ledgerPromise = campaignCached(accountKey(ID, a), () => fetchCampaignLedger(token))
+
           // the wallets: v2 first, the v1 instances as fallback (as before)
           let walletsPayload = null
           let isV2 = false
@@ -1421,6 +1597,12 @@ export async function AutoClawAuthPlugin({ client } = {}) {
             if (task) signin = { status: String(task.status ?? ""), reward: toNum(task.reward_points) ?? 0 }
           } catch {}
 
+          // the card's half of the reward (null = unreadable, the row stays as
+          // it was). A task day and a card day are independent: the row is
+          // signed only when every part that exists today is taken, and its
+          // amount is the sum of the parts (task 200 + card 300 = 500).
+          const card = await cardPromise
+
           const track = balanceObserve(accountKey(ID, a), total)
 
           const windows = []
@@ -1441,16 +1623,24 @@ export async function AutoClawAuthPlugin({ client } = {}) {
                 (track.dayGained > 0 ? ` · 今日 +${fmtPoints(track.dayGained)}` : ""),
             })
           }
-          // the check-in row only expresses state (used stays 0)
-          if (signin) {
+          // the check-in row only expresses state (used stays 0). The desktop
+          // card stacks with the task reward, so its daily amount joins the
+          // row: task done + card claimed → 「今日已签 ✓ +500」.
+          const cardCounts = card?.visible === true
+          const cardTaken = cardCounts && (card.status === "claimed" || card.claimed > 0)
+          const reward = (signin ? signin.reward : 0) + (cardCounts ? Math.max(0, card.dailyAmount) : 0)
+          if (signin || cardCounts) {
+            // with no task info the card alone decides the state (a 300 card
+            // day is still a signed day); an unreadable card leaves the task
+            // state alone
+            const done = cardCounts ? (signin ? signin.status === "completed" : true) && cardTaken : signin.status === "completed"
             windows.push({
               name: "每日签到",
               used: 0,
               aside: true,
-              display:
-                signin.status === "completed"
-                  ? `今日已签 ✓${signin.reward ? ` +${fmtPoints(signin.reward)}` : ""}`
-                  : `今日未签${signin.reward ? `（+${fmtPoints(signin.reward)}）` : ""}`,
+              display: done
+                ? `今日已签 ✓${reward ? ` +${fmtPoints(reward)}` : ""}`
+                : `今日未签${reward ? `（+${fmtPoints(reward)}）` : ""}`,
             })
           }
           // points are a pure balance: no total/no used. This window is the one
@@ -1461,7 +1651,7 @@ export async function AutoClawAuthPlugin({ client } = {}) {
           // the campaign row: display-only, any failure omits it
           let campaignRow = null
           try {
-            const entries = await campaignCached(accountKey(ID, a), () => fetchCampaignLedger(token))
+            const entries = await ledgerPromise
             const camp = campaignBreakdown(entries)
             // when part of the activity stock lapses soon, mark the moment on
             // the balance window (never a second balance-bearing window)
@@ -1483,10 +1673,10 @@ export async function AutoClawAuthPlugin({ client } = {}) {
           } catch {}
           if (campaignRow) windows.push(campaignRow)
 
-          // the web shortcut last: `used` is omitted on purpose (unreported =
-          // no share, not 0%). The token is the post-fresh() one, so the link
-          // stays valid for at least REFRESH_LEAD.
-          windows.push({ name: WEB_ENTRY_WINDOW, display: webEntryUrl(token), aside: true })
+          // the web shortcut last: a fixed hint (the link itself is printed by
+          // `web.mjs` — the GUI cannot show or copy it). `used` is omitted on
+          // purpose (unreported = no share, not 0%).
+          windows.push({ name: WEB_ENTRY_WINDOW, display: webEntryHintText, aside: true })
 
           const parts = named.map((w) => `${w.displayName} ${fmtPoints(w.balance)}`)
           return {
@@ -1502,10 +1692,12 @@ export async function AutoClawAuthPlugin({ client } = {}) {
       },
       // the daily flow: campaign ledger (today's payout already in? read
       // before, confirm after) → user-info (the login event that pays the
-      // activity reward, best effort, skipped when already paid) → task-list
-      // (skip what is already done) → press the remaining task(s). The two
-      // tasks are independent — a non-auth failure of one never blocks the
-      // other — while an auth failure (401 / 410000 / SignedOut) ends the whole
+      // activity reward, best effort, skipped when already paid) → the
+      // desktop client's check-in card (read + claim, before the task list so
+      // no early `inactive` return can skip it) → task-list (skip what is
+      // already done) → press the remaining task(s). The two tasks and the card
+      // are independent — a non-auth failure of one never blocks the others —
+      // while an auth failure (401 / 410000 / SignedOut) ends the whole
       // check-in as expired. A 403 that is a spent quota or a banned account is
       // thrown as-is with signIn "kept".
       async checkin(getAuth) {
@@ -1566,6 +1758,46 @@ export async function AutoClawAuthPlugin({ client } = {}) {
           return { ...result, message: result.message ? `${result.message}；${rewardText}` : rewardText }
         }
 
+        // ①b the desktop client's 「签到卡」: an independent +300/day that
+        // stacks with the tasks (a desktop day is 500: 200 tasks + 300 card).
+        // Read and claimed *before* the task list, so the `inactive` returns
+        // below cannot skip it — and before that, a null / invisible card is
+        // simply skipped. An expired sign-in throws; every other failure is
+        // only reported and never blocks the tasks.
+        let card = null
+        let cardResult = { kind: "skipped" }
+        try {
+          card = await readCheckinCard(a.access)
+        } catch (e) {
+          if (e?.signIn === "expired" || e instanceof SignedOut) throw expired("AutoClaw 登录态已失效，无法签到（请重新登录）")
+          card = null // unreadable: don't guess, don't claim
+        }
+        if (card && card.visible) {
+          // claimed / processing / nothing left to take: the poll or the next
+          // run sees the final state, so no write is attempted
+          const settled = card.status === "claimed" || card.status === "processing" || !(card.claimable > 0)
+          cardResult = settled
+            ? { kind: "done" }
+            : await claimCheckinCard(
+                a.access,
+                checkinClientRequestId(accountKey(ID, a), card.bizDate || beijingDayOf()),
+              )
+          // a claim changed today's card: the usage row's cached read is stale
+          if (cardResult.kind === "claimed") cardCache.delete(accountKey(ID, a))
+        }
+        // the card's message segment (skipped appends nothing)
+        const cardText =
+          cardResult.kind === "claimed"
+            ? `签到卡 +${fmtPoints(cardResult.amount)}`
+            : cardResult.kind === "done"
+              ? "签到卡今日已领"
+              : cardResult.kind === "ineligible"
+                ? `签到卡不可领（${cardResult.reason}）`
+                : cardResult.kind === "failed"
+                  ? `签到卡：${cardResult.reason}`
+                  : ""
+        const withCard = (message) => (cardText ? (message ? `${message}；${cardText}` : cardText) : message)
+
         // one task's press → { kind:"claimed", reward } | { kind:"done" } |
         // { kind:"failed", reason }; auth failures throw expired
         const press = async (taskId) => {
@@ -1602,10 +1834,24 @@ export async function AutoClawAuthPlugin({ client } = {}) {
         let signin
         let inspiration
         if (Array.isArray(tasks)) {
-          if (!tasks.length) return note({ outcome: "inactive", message: "当前没有签到活动" })
           const signinTask = tasks.find((t) => t?.task_id === DAILY_SIGNIN_TASK_ID)
           const inspirationTask = tasks.find((t) => t?.task_id === INSPIRATION_TASK_ID)
-          if (!signinTask && !inspirationTask) return note({ outcome: "inactive", message: "当前没有签到活动" })
+          // no task to press: the card alone decides the outcome. Pre-0.6.0
+          // this returned `inactive` right here, which would lose the card on
+          // every day the vendor shipped an empty task list.
+          if (!signinTask && !inspirationTask) {
+            if (cardResult.kind === "skipped") return note({ outcome: "inactive", message: "当前没有签到活动" })
+            const outcome =
+              cardResult.kind === "claimed"
+                ? "claimed"
+                : cardResult.kind === "done"
+                  ? "done"
+                  : cardResult.kind === "failed"
+                    ? "failed"
+                    : "inactive"
+            const credit = cardResult.kind === "claimed" ? cardResult.amount : 0
+            return note({ outcome, credit, message: withCard("当前没有签到任务") })
+          }
           const skipped = { kind: "done" }
           signin = !signinTask || String(signinTask.status ?? "") === "completed" ? skipped : await press(DAILY_SIGNIN_TASK_ID)
           inspiration =
@@ -1615,7 +1861,8 @@ export async function AutoClawAuthPlugin({ client } = {}) {
           inspiration = await press(INSPIRATION_TASK_ID)
         }
 
-        const credit = (signin.reward ?? 0) + (inspiration.reward ?? 0)
+        const credit =
+          (signin.reward ?? 0) + (inspiration.reward ?? 0) + (cardResult.kind === "claimed" ? cardResult.amount : 0)
         const signinText =
           signin.kind === "claimed"
             ? signin.reward > 0
@@ -1633,12 +1880,12 @@ export async function AutoClawAuthPlugin({ client } = {}) {
               ? "灵感中心今日已领"
               : `灵感中心：${inspiration.reason}`
         const outcome =
-          signin.kind === "claimed" || inspiration.kind === "claimed"
+          signin.kind === "claimed" || inspiration.kind === "claimed" || cardResult.kind === "claimed"
             ? "claimed"
             : signin.kind === "failed" || inspiration.kind === "failed"
               ? "failed"
               : "done"
-        return note({ outcome, credit, message: `${signinText}；${inspirationText}` })
+        return note({ outcome, credit, message: withCard(`${signinText}；${inspirationText}`) })
       },
       methods,
     },
@@ -1729,9 +1976,23 @@ export const _internal = {
   upstreamBase,
   webBase,
   webEntryUrl,
+  webEntryHintText,
   INSPIRATION_TASK_ID,
   WEB_ENTRY_WINDOW,
   TASK_LIST_PATH,
+  CHECKIN_CARD_PATH,
+  CHECKIN_CLAIM_PATH,
+  CHECKIN_CARD_VERSION,
+  CARD_ALREADY_CLAIMED_CODE,
+  CARD_PROCESSING_CODE,
+  CARD_NOT_ELIGIBLE_CODE,
+  CARD_IDENTITY_UNAVAILABLE_CODE,
+  checkinCardHeaders,
+  checkinCardRequest,
+  readCheckinCard,
+  claimCheckinCard,
+  claimedCardAmount,
+  checkinClientRequestId,
   WALLETS_PATH,
   LEGACY_WALLETS_PATH,
   CAMPAIGN_LEDGER_PATH,
@@ -1763,6 +2024,8 @@ export const _internal = {
   readCampaignForCheckin,
   campaignCached,
   campaignCache,
+  cardCached,
+  cardCache,
   fmtPoints,
   setUsageStatePath,
   usageStatePath: currentUsageStatePath,

@@ -17,8 +17,22 @@ function jwt(exp, userId, deviceId) {
 // Beijing day is unambiguous
 const beijingIso = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().replace(/\.\d+Z$/, "+08:00")
 
+// the vendor's day runs on Beijing time (the card's `biz_date`)
+const beijingDay = (ms = Date.now()) => new Date(ms + 8 * 3600e3).toISOString().slice(0, 10)
+
 const APP_ID = "100003"
 const APP_KEY = "38d2391985e2369a5fb8227d8e6cd5e5"
+
+// the desktop client's 「签到卡」 routes and the idempotency key's UUID shape
+const CARD_PATH = "/asset-operation/api/v1/checkin/card"
+const CLAIM_PATH = "/asset-operation/api/v1/checkin/claim"
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+// the 2.5.x client's card headers: signed, an `X-Request-ID`, `X-Version`
+// 2.5.3, and none of magpie's harness headers (the plugin must look like the
+// desktop app on these paths)
+const cardRequestOk = (h) =>
+  !h.get("x-harness-type") && !h.get("x-client-type") && Boolean(h.get("x-request-id")) && h.get("x-version") === "2.5.3"
 
 export function fakeAutoClaw() {
   const state = {
@@ -48,6 +62,25 @@ export function fakeAutoClaw() {
     // the campaign ledger rows and an HTTP status to fail with
     campaignEntries: [],
     ledgerStatus: 0,
+    // the desktop client's 「签到卡」 (2.5.x). Hidden unless a case shows it, so
+    // the task-only expectations stay exactly as they were. cardMode picks a
+    // canned server behaviour: normal | hidden | error | notEligible |
+    // alreadyClaimed | processing; cardReadCode / cardClaimCode override the
+    // business code and cardReadStatus / cardClaimStatus the HTTP status.
+    cardVisible: false,
+    cardClaimable: 300,
+    cardStatus: "unclaimed", // unclaimed | claimed | processing
+    cardDailyAmount: 300,
+    cardBizDate: "", // "" = today's Beijing day
+    cardMode: "normal",
+    cardReadCode: 0,
+    cardClaimCode: 0,
+    cardReadStatus: 0,
+    cardClaimStatus: 0,
+    cardCalls: 0,
+    claimCalls: 0,
+    claimRequestIds: [],
+    lastCardHeaders: null,
     // the login hook: when set, a successful user-info pays one today-dated
     // activity credit into the ledger (amount / description configurable) —
     // the vendor's auto-grant, so the check-in's read-back has something to see
@@ -83,6 +116,20 @@ export function fakeAutoClaw() {
       state.taskListMode = "normal"
       state.campaignEntries = []
       state.ledgerStatus = 0
+      state.cardVisible = false
+      state.cardClaimable = 300
+      state.cardStatus = "unclaimed"
+      state.cardDailyAmount = 300
+      state.cardBizDate = ""
+      state.cardMode = "normal"
+      state.cardReadCode = 0
+      state.cardClaimCode = 0
+      state.cardReadStatus = 0
+      state.cardClaimStatus = 0
+      state.cardCalls = 0
+      state.claimCalls = 0
+      state.claimRequestIds = []
+      state.lastCardHeaders = null
       state.creditOnUserInfo = null
       state.creditOnUserInfoPaid = false
       state.chatRefusal = null
@@ -131,6 +178,8 @@ export function fakeAutoClaw() {
         "/agentpay/v1/assistant/subscribe-info",
         "/autoclaw-proxy/proxy/autoclaw-task-complete",
         "/autoclaw-proxy/proxy/autoclaw-task-list",
+        "/asset-operation/api/v1/checkin/card",
+        "/asset-operation/api/v1/checkin/claim",
       ])
       const isAccountDomain =
         path.startsWith("/userapi/") || path.startsWith("/agent-assetmgr/") || path.startsWith("/agentpay/") || AUTHED.has(path)
@@ -265,6 +314,72 @@ export function fakeAutoClaw() {
               { task_id: "daily_signin", status: state.signinDone ? "completed" : "active", reward_points: 200 },
               { task_id: "daily_inspiration_center", status: state.inspirationDone ? "completed" : "active", reward_points: 200, client_triggered: true },
             ],
+          })
+        }
+
+        // ── the desktop client's 「签到卡」 (2.5.x) ─────────────────────
+        // The client's own protocol: signed, Bearer, an `X-Request-ID`, and
+        // none of magpie's harness headers (the plugin must look like the
+        // desktop app on these paths).
+        if (path === CARD_PATH) {
+          state.cardCalls++
+          state.lastCardHeaders = Object.fromEntries(req.headers)
+          if (!cardRequestOk(req.headers)) return json(400, { code: 400_001, msg: "请求头不符合客户端" })
+          if (state.cardReadStatus) return json(state.cardReadStatus, { code: 500_000, msg: "内部错误" })
+          if (state.cardReadCode) return json(200, { code: state.cardReadCode, msg: "读卡失败" })
+          if (state.cardMode === "error") return json(500, { code: 500_000, msg: "内部错误" })
+          const visible = state.cardMode === "hidden" ? false : state.cardVisible
+          const status = state.cardMode === "processing" ? "processing" : state.cardStatus
+          const claimed = status === "claimed" ? state.cardDailyAmount : 0
+          // a claimed / processing card has nothing left to take
+          const claimable = visible && status === "unclaimed" ? state.cardClaimable : 0
+          return json(200, {
+            code: 0,
+            msg: "ok",
+            data: {
+              biz_date: state.cardBizDate || beijingDay(),
+              card_visible: visible,
+              claim_status: status,
+              total_claimable_amount: claimable,
+              claimed_amount: claimed,
+              daily: { amount: state.cardDailyAmount, title: "签到卡", validity_seconds: 86_400, streak: { days: 1 } },
+              events: [],
+              claimed_items: claimed ? [{ amount: claimed, status: "success", replayed: false }] : [],
+              vip_benefit: { text_type: "upgrade" },
+              cta: {},
+            },
+          })
+        }
+
+        if (path === CLAIM_PATH) {
+          state.claimCalls++
+          const requestId = body?.client_request_id
+          state.claimRequestIds.push(requestId)
+          if (!cardRequestOk(req.headers)) return json(400, { code: 400_001, msg: "请求头不符合客户端" })
+          if (typeof requestId !== "string" || !UUID_SHAPE.test(requestId))
+            return json(400, { code: 400_001, msg: "client_request_id 缺失或格式错误" })
+          if (state.cardClaimStatus) return json(state.cardClaimStatus, { code: 500_000, msg: "内部错误" })
+          if (state.cardClaimCode) return json(200, { code: state.cardClaimCode, msg: "领取失败" })
+          if (state.cardMode === "notEligible") return json(200, { code: 650_301, msg: "账号暂无领取资格" })
+          if (state.cardMode === "alreadyClaimed") return json(200, { code: 650_304, msg: "今日已领取" })
+          if (state.cardMode === "processing") return json(200, { code: 650_302, msg: "领取处理中" })
+          if (!state.cardVisible) return json(200, { code: 650_303, msg: "身份不可用" })
+          if (state.cardStatus === "claimed") return json(200, { code: 650_304, msg: "今日已领取" })
+          if (!(state.cardClaimable > 0)) return json(200, { code: 650_301, msg: "账号暂无领取资格" })
+          // a claim takes the card: the next read reports it as claimed
+          state.cardStatus = "claimed"
+          state.cardClaimable = 0
+          return json(200, {
+            code: 0,
+            msg: "ok",
+            data: {
+              result: "success",
+              biz_date: state.cardBizDate || beijingDay(),
+              claimed_amount: state.cardDailyAmount,
+              retryable: false,
+              items: [{ amount: state.cardDailyAmount, status: "success", replayed: false, reward_source: "checkin_card", title: "签到卡" }],
+              popup_reward_groups: [],
+            },
           })
         }
 

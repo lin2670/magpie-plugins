@@ -60,6 +60,7 @@ beforeEach(async () => {
   // never touch the real ~/.config/magpie: every test gets its own state file
   _internal.setUsageStatePath(join(tmpDir, `usage-${++usageSeq}.json`))
   _internal.campaignCache.clear()
+  _internal.cardCache.clear()
 })
 
 describe("sign-in methods", () => {
@@ -571,31 +572,41 @@ describe("usage", () => {
     expect(fake.state.walletCalls).toBe(1)
   })
 
-  test("the web entry carries the access token and only whitelisted fields", async () => {
+  test("the web entry is a fixed short hint and carries no token", async () => {
     const usage = await plugin.auth.usage(getAuth)
     const web = webWindow(usage)
     expect(web.aside).toBe(true)
     expect(web.used).toBeUndefined()
-    expect(web.display).toBe(`https://autoglm.zhipuai.cn/?autoglm_token=${encodeURIComponent(fake.state.access)}`)
+    expect(web.display).toBe(_internal.webEntryHintText)
+    expect(web.display).toBe("打开网页版：bunx magpie-autoclaw-cn-auth web")
+    // the GUI truncates a long `display` and offers no copy action, so the
+    // token link must never land there (web.mjs prints it instead)
+    expect(web.display).not.toContain("autoglm_token")
+    expect(web.display).not.toContain(fake.state.access)
+    expect(JSON.stringify(usage.windows)).not.toContain(encodeURIComponent(fake.state.access))
     // host.js drops unknown window fields: nothing invented
     expect(Object.keys(web).sort()).toEqual(["aside", "display", "name"])
   })
 
-  test("a near-expiry token renews first, and the link carries the renewed one", async () => {
+  test("a near-expiry token still renews before the card is built", async () => {
     saved = { type: "oauth", access: "stale-token", refresh: fake.state.refresh, deviceId: fake.state.deviceId, expires: Date.now() + 30_000 }
     const usage = await plugin.auth.usage(getAuth)
     expect(fake.state.refreshCalls.length).toBe(1)
     expect(saved.access).toBe(fake.state.access)
-    const web = webWindow(usage)
-    expect(web.display).toContain(`autoglm_token=${encodeURIComponent(fake.state.access)}`)
-    expect(web.display).not.toContain("stale-token")
+    // the renewed token is used, but the window stays the hint
+    expect(webWindow(usage).display).toBe(_internal.webEntryHintText)
+    expect(webWindow(usage).display).not.toContain(fake.state.access)
   })
 
-  test("AUTOCLAW_WEB_BASE_URL overrides the web host", async () => {
+  test("a custom web host no longer changes the window text", async () => {
     process.env.AUTOCLAW_WEB_BASE_URL = "https://web.example.test/"
     try {
       const usage = await plugin.auth.usage(getAuth)
-      expect(webWindow(usage).display.startsWith("https://web.example.test/?autoglm_token=")).toBe(true)
+      expect(webWindow(usage).display).toBe(_internal.webEntryHintText)
+      // the link builder still honours the override (web.mjs prints that link)
+      expect(_internal.webEntryUrl(fake.state.access)).toBe(
+        `https://web.example.test/?autoglm_token=${encodeURIComponent(fake.state.access)}`,
+      )
     } finally {
       delete process.env.AUTOCLAW_WEB_BASE_URL
     }
@@ -887,5 +898,306 @@ describe("helpers", () => {
     _internal.setUsageStatePath(join(tmpDir, "isolated.json"))
     _internal.balanceObserve(`autoclaw|uid:isolated-${usageSeq}`, 1000)
     expect(_internal.usageStatePath()).toBe(join(tmpDir, "isolated.json"))
+  })
+})
+
+// the desktop client's 「签到卡」 (2.5.x): +300/day on top of the two tasks
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+// the card is hidden by default (the task-only expectations above); a case
+// shows it and configures one server behaviour
+const cardOn = (over = {}) =>
+  Object.assign(fake.state, {
+    cardVisible: true,
+    cardClaimable: 300,
+    cardStatus: "unclaimed",
+    cardDailyAmount: 300,
+    cardMode: "normal",
+    ...over,
+  })
+
+describe("checkin card", () => {
+  const pressed = () => fake.state.taskCalls.map((c) => c.task_id)
+
+  test("tasks already done + an unclaimed card: the card is claimed on top", async () => {
+    cardOn()
+    fake.state.signinDone = true
+    fake.state.inspirationDone = true
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(300)
+    expect(result.message).toContain("签到卡 +300")
+    expect(pressed()).toEqual([])
+    expect(fake.state.cardCalls).toBe(1)
+    expect(fake.state.claimCalls).toBe(1)
+    // the claim carries a UUID-shaped idempotency key (the fake rejects others)
+    expect(fake.state.claimRequestIds).toHaveLength(1)
+    expect(fake.state.claimRequestIds[0]).toMatch(UUID_SHAPE)
+  })
+
+  test("open tasks + an unclaimed card: the credit is the sum of both segments", async () => {
+    cardOn()
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(700) // 200 + 200 tasks + 300 card
+    expect(result.message).toContain("签到成功，获得 200 积分")
+    expect(result.message).toContain("灵感中心已领取 200 积分")
+    expect(result.message).toContain("签到卡 +300")
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+  })
+
+  test("a card already claimed today is not claimed again", async () => {
+    cardOn({ cardStatus: "claimed", cardClaimable: 0 })
+    const result = await plugin.auth.checkin(getAuth)
+    expect(fake.state.cardCalls).toBe(1)
+    expect(fake.state.claimCalls).toBe(0)
+    expect(result.outcome).toBe("claimed") // the task segment decides
+    expect(result.credit).toBe(400)
+    expect(result.message).toContain("签到卡今日已领")
+  })
+
+  test("an invisible card is skipped without a word", async () => {
+    const result = await plugin.auth.checkin(getAuth)
+    expect(fake.state.cardCalls).toBe(1)
+    expect(fake.state.claimCalls).toBe(0)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    expect(result.message).not.toContain("签到卡")
+  })
+
+  test("an unreadable card (5xx) never blocks the tasks", async () => {
+    cardOn({ cardMode: "error" })
+    const result = await plugin.auth.checkin(getAuth)
+    expect(fake.state.claimCalls).toBe(0)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    expect(result.message).not.toContain("签到卡")
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+  })
+
+  test("a card read with a non-zero business code is unusable, not claimed", async () => {
+    cardOn({ cardReadCode: 500_001 })
+    const result = await plugin.auth.checkin(getAuth)
+    expect(fake.state.claimCalls).toBe(0)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    expect(result.message).not.toContain("签到卡")
+  })
+
+  test("claim code 650304 (already claimed) reads as done", async () => {
+    cardOn({ cardClaimCode: 650_304 })
+    const result = await plugin.auth.checkin(getAuth)
+    expect(fake.state.claimCalls).toBe(1)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(400)
+    expect(result.message).toContain("签到卡今日已领")
+  })
+
+  test("claim code 650302 (processing) reads as done, no retry", async () => {
+    cardOn({ cardClaimCode: 650_302 })
+    const result = await plugin.auth.checkin(getAuth)
+    expect(fake.state.claimCalls).toBe(1)
+    expect(result.credit).toBe(400)
+    expect(result.message).toContain("签到卡今日已领")
+  })
+
+  test("claim codes 650301 / 650303 read as ineligible, exactly one attempt", async () => {
+    for (const code of [650_301, 650_303]) {
+      fake.state.reset()
+      saved = { type: "oauth", access: fake.state.access, refresh: fake.state.refresh, deviceId: fake.state.deviceId, expires: Date.now() + 3600e3 }
+      _internal.cardCache.clear()
+      cardOn({ cardClaimCode: code })
+      const result = await plugin.auth.checkin(getAuth)
+      expect(result.outcome).toBe("claimed") // the task segment still pays
+      expect(result.credit).toBe(400)
+      expect(result.message).toContain("签到卡不可领（")
+      expect(fake.state.claimCalls).toBe(1)
+    }
+  })
+
+  test("claim code 410000 ends the check-in as expired", async () => {
+    cardOn({ cardClaimCode: 410_000 })
+    await expect(plugin.auth.checkin(getAuth)).rejects.toThrow(/失效/)
+    // the card comes before the task list: nothing else is attempted
+    expect(fake.state.taskListCalls).toBe(0)
+    expect(pressed()).toEqual([])
+  })
+
+  test("a claim that fails at the transport layer is reported, the tasks stand", async () => {
+    cardOn({ cardClaimStatus: 500 })
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed") // the task segment decides
+    expect(result.credit).toBe(400)
+    expect(result.message).toContain("签到卡：")
+    expect(pressed()).toEqual(["daily_signin", "daily_inspiration_center"])
+  })
+
+  test("an empty task list still claims the card instead of returning inactive", async () => {
+    cardOn()
+    fake.state.taskListMode = "empty"
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("claimed")
+    expect(result.credit).toBe(300)
+    expect(result.message).toContain("当前没有签到任务；签到卡 +300")
+    expect(fake.state.claimCalls).toBe(1)
+    expect(pressed()).toEqual([])
+  })
+
+  test("an empty task list with an invisible card stays inactive", async () => {
+    fake.state.taskListMode = "empty"
+    const result = await plugin.auth.checkin(getAuth)
+    expect(result.outcome).toBe("inactive")
+    expect(result.message).toBe("当前没有签到活动")
+    expect(fake.state.claimCalls).toBe(0)
+  })
+
+  test("the idempotency key is stable per account per Beijing day", () => {
+    const key = _internal.accountKey("autoclaw", { uid: "20260001" })
+    const a = _internal.checkinClientRequestId(key, "2026-11-26")
+    expect(a).toMatch(UUID_SHAPE)
+    expect(_internal.checkinClientRequestId(key, "2026-11-26")).toBe(a)
+    // another account, another day
+    expect(_internal.checkinClientRequestId(_internal.accountKey("autoclaw", { uid: "20260002" }), "2026-11-26")).not.toBe(a)
+    expect(_internal.checkinClientRequestId(key, "2026-11-27")).not.toBe(a)
+  })
+
+  test("two check-ins on the same day use the same client_request_id", async () => {
+    cardOn({ cardClaimStatus: 500 }) // the claim fails, so both runs attempt one
+    await plugin.auth.checkin(getAuth)
+    await plugin.auth.checkin(getAuth)
+    expect(fake.state.claimRequestIds).toHaveLength(2)
+    expect(fake.state.claimRequestIds[0]).toBe(fake.state.claimRequestIds[1])
+  })
+
+  test("the card request carries the client's headers and none of magpie's", async () => {
+    cardOn()
+    await plugin.auth.checkin(getAuth)
+    const h = fake.state.lastCardHeaders
+    expect(h["x-harness-type"]).toBeUndefined()
+    expect(h["x-client-type"]).toBeUndefined()
+    expect(h["x-request-id"]).toMatch(UUID_SHAPE)
+    expect(h["x-version"]).toBe("2.5.3")
+    expect(h["x-product"]).toBe("autoclaw")
+    expect(h["x-lang"]).toBe("zh-CN")
+    expect(h["x-channel"]).toBe("official")
+    expect(h.accept).toBe("application/json")
+    expect(h.authorization).toBe(`Bearer ${fake.state.access}`)
+    expect(h["x-auth-sign"]).toBe(
+      createHash("md5").update(`100003&${h["x-auth-timestamp"]}&38d2391985e2369a5fb8227d8e6cd5e5`).digest("hex"),
+    )
+  })
+})
+
+describe("checkin card protocol", () => {
+  test("readCheckinCard normalizes the payload", async () => {
+    cardOn()
+    const card = await _internal.readCheckinCard(fake.state.access)
+    expect(card.bizDate).toBe(_internal.beijingDayOf())
+    expect(card.visible).toBe(true)
+    expect(card.status).toBe("unclaimed")
+    expect(card.claimable).toBe(300)
+    expect(card.claimed).toBe(0)
+    expect(card.dailyAmount).toBe(300)
+    expect(card.streakDays).toBe(1)
+    expect(card.todayCheckedIn).toBe(false)
+    expect(Date.parse(card.expiresAt)).toBeGreaterThan(Date.now() + 3600e3)
+    expect(Object.keys(card).sort()).toEqual([
+      "bizDate",
+      "claimable",
+      "claimed",
+      "dailyAmount",
+      "expiresAt",
+      "status",
+      "streakDays",
+      "todayCheckedIn",
+      "visible",
+    ])
+  })
+
+  test("a hidden card is visible:false, a business error is null", async () => {
+    const hidden = await _internal.readCheckinCard(fake.state.access)
+    expect(hidden.visible).toBe(false)
+    expect(hidden.dailyAmount).toBe(300)
+    fake.state.cardReadCode = 500_001
+    expect(await _internal.readCheckinCard(fake.state.access)).toBeNull()
+  })
+
+  test("claimCheckinCard reports the amount and flips the card's state", async () => {
+    cardOn()
+    const verdict = await _internal.claimCheckinCard(fake.state.access, "3f7a1c2e-1b2c-4d5e-8f90-1234567890ab")
+    expect(verdict).toEqual({ kind: "claimed", amount: 300 })
+    const after = await _internal.readCheckinCard(fake.state.access)
+    expect(after.status).toBe("claimed")
+    expect(after.claimable).toBe(0)
+    expect(after.todayCheckedIn).toBe(true)
+  })
+
+  test("a success with no amount is done, not a zero credit", async () => {
+    cardOn({ cardDailyAmount: 0 })
+    const verdict = await _internal.claimCheckinCard(fake.state.access, "3f7a1c2e-1b2c-4d5e-8f90-1234567890ab")
+    expect(verdict).toEqual({ kind: "done" })
+  })
+
+  test("the amount falls back to the non-replayed items", () => {
+    expect(_internal.claimedCardAmount({ items: [{ amount: 100 }, { amount: 200, replayed: true }, { amount: 50 }] })).toBe(150)
+    // an explicit 0 is the server's answer, never replaced by the items
+    expect(_internal.claimedCardAmount({ claimed_amount: 0, items: [{ amount: 300 }] })).toBe(0)
+  })
+
+  test("the card headers are the client's set", () => {
+    const h = _internal.checkinCardHeaders("tok")
+    expect(h["X-Version"]).toBe("2.5.3")
+    expect(h["X-Request-ID"]).toMatch(UUID_SHAPE)
+    expect(h.Accept).toBe("application/json")
+    expect(h.authorization).toBe("Bearer tok")
+    expect(h["X-Harness-Type"]).toBeUndefined()
+    expect(h["X-Client-Type"]).toBeUndefined()
+    expect(_internal.checkinCardHeaders("").authorization).toBeUndefined()
+  })
+})
+
+describe("checkin card in usage", () => {
+  const signinWindow = (usage) => usage.windows.find((w) => w.name === "每日签到")
+
+  test("a claimed card joins the task reward: 今日已签 ✓ +500", async () => {
+    cardOn({ cardStatus: "claimed", cardClaimable: 0 })
+    fake.state.signinDone = true
+    fake.state.inspirationDone = true
+    const usage = await plugin.auth.usage(getAuth)
+    expect(signinWindow(usage).display).toBe("今日已签 ✓ +500")
+    expect(fake.state.walletCalls).toBe(1)
+    expect(fake.state.cardCalls).toBe(1)
+  })
+
+  test("an invisible card leaves the row at the task reward (+200)", async () => {
+    const usage = await plugin.auth.usage(getAuth)
+    expect(signinWindow(usage).display).toBe("今日未签（+200）")
+    expect(fake.state.walletCalls).toBe(1)
+    expect(fake.state.cardCalls).toBe(1)
+  })
+
+  test("an unclaimed card is still owed: 今日未签（+500）", async () => {
+    cardOn()
+    const usage = await plugin.auth.usage(getAuth)
+    expect(signinWindow(usage).display).toBe("今日未签（+500）")
+  })
+
+  test("an unreadable card keeps the row as it was", async () => {
+    cardOn({ cardMode: "error" })
+    const usage = await plugin.auth.usage(getAuth)
+    expect(signinWindow(usage).display).toBe("今日未签（+200）")
+    expect(usage.windows.map((w) => w.name)).toEqual(["每日签到", "积分余额", "网页版快捷登录"])
+  })
+
+  test("the card read is cached and a claim clears it", async () => {
+    cardOn()
+    await plugin.auth.usage(getAuth)
+    await plugin.auth.usage(getAuth)
+    expect(fake.state.cardCalls).toBe(1) // cached for 10 minutes
+    await plugin.auth.checkin(getAuth) // claims the card
+    expect(fake.state.claimCalls).toBe(1)
+    const after = await plugin.auth.usage(getAuth)
+    expect(fake.state.cardCalls).toBe(3) // the claim cleared the cache
+    expect(signinWindow(after).display).toBe("今日已签 ✓ +500")
   })
 })
